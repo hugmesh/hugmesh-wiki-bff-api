@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!-- 005 — published state columns on wiki_page.
+
+         is_published — whether the page has been EXPLICITLY published by an admin
+           (i.e. the POST /bff/wiki/{slug}/publish endpoint has been called at least
+           once). Defaults false — a newly created page is in DRAFT state until
+           published. The ZIM (re)build ONLY packages published pages.
+
+         published_at — the timestamp of the LAST publish action (null = never
+           published). Null for existing rows (migrated from before this changeset).
+           Used by the ZIM trigger to detect pages that have been republished since
+           the last build. -->
+    <changeSet id="005-wiki-publish" author="hugmesh">
+        <addColumn tableName="wiki_page">
+            <column name="is_published" type="boolean" defaultValueBoolean="false">
+                <constraints nullable="false"/>
+            </column>
+            <column name="published_at" type="timestamp"/>
+        </addColumn>
+    </changeSet>
+</databaseChangeLog>

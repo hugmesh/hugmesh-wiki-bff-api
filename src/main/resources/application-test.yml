@@ -1,0 +1,18 @@
+# Full-context (@SpringBootTest + @ActiveProfiles("test")) test profile. The DB is a
+# REAL Postgres container wired by the commons PostgresTestSupport base: its
+# @DynamicPropertySource supplies spring.r2dbc.url (the app's reactive ConnectionFactory)
+# AND spring.liquibase.url (the JDBC handle Liquibase migrates), both pointed at the
+# SAME fresh per-class database, so the standard R2DBC + Liquibase auto-config runs
+# against the container — NO H2, NO autoconfigure excludes (the dual-handle in-mem H2
+# stopped sharing a store under Spring Boot 4).
+#
+# The @DataR2dbcTest SLICE tests do NOT activate this profile; they keep their own H2
+# ConnectionFactory + Liquibase via TestDatabaseConfig (the inherited r2dbc-h2 + h2
+# pins), so this file's removal of the H2 excludes does not affect them.
+#
+# The full-context tests mock the ReactiveJwtDecoder, so the oauth2 resource-server
+# never dials the configured issuer at boot.
+spring:
+  liquibase:
+    enabled: true
+    change-log: "classpath:db/changelog/db.changelog-master.xml"

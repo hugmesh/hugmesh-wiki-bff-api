@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- The org metapom — consolidates the Spring Boot 4.0.7 / Java 25 reactive BFF
+       baseline (WebFlux + Casdoor OAuth2 resource server + R2DBC/Liquibase +
+       SpringDoc), the shared <dependencies>, dependencyManagement (hugmesh-commons,
+       AWS SDK BOM, resilience4j, springdoc), pluginManagement (compiler / surefire
+       bytebuddy flag / spring-boot / native) and the GitLab Maven publishing wiring.
+       hugmesh-parent is itself a child of spring-boot-starter-parent:4.0.7, so the
+       Spring Boot dependency + plugin management is inherited TRANSITIVELY. -->
+  <parent>
+    <groupId>systems.hugmesh</groupId>
+    <artifactId>hugmesh-parent</artifactId>
+    <version>2.8.0</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>systems.hugmesh</groupId>
+  <!-- NO -api suffix in the artifactId (mirrors forum-bff / user-bff / admin-bff):
+       -api is only in the repo/service/image name. -->
+  <artifactId>wiki-bff</artifactId>
+  <version>0.2.0</version>
+
+  <properties>
+    <!-- java.version (25), encoding, the hugmesh-commons version, the AWS SDK BOM
+         version, the resilience4j version and the springdoc version are all inherited
+         from hugmesh-parent. ONLY the wiki-bff-specific pins stay below. -->
+
+    <!-- CommonMark renderer pin — the markdown->HTML transform run at WRITE time
+         (TIER 1 content store). The stored content_html is the rendered snapshot the
+         ZIM (re)build packages, so rendering once at write keeps the read path
+         (kiwix-serve) free of any render step. Repo-specific. -->
+    <commonmark.version>0.24.0</commonmark.version>
+  </properties>
+
+  <dependencies>
+    <!-- The shared, canonical HugMesh security/tenancy/config/web building blocks
+         (Casdoor JWT authorities, issuer->domain DomainRegistry, Roles helper, the
+         config-gated multi-issuer TenancyResourceServerConfig, the static-utility
+         DomainScope, the BFF ApiException). Version is MANAGED by hugmesh-parent's
+         dependencyManagement, so NO <version> here. This replaces wiki-bff's deleted
+         local copies of security.{Roles,CasdoorAuthorities,DomainRegistry,DomainScope},
+         config.TenancyResourceServerConfig and web.ApiException. The repo's own
+         security.PrincipalDomain (@Component, forScope/__deny__ fail-closed scope
+         resolver — NOT the commons PrincipalDomain value object) stays per-repo. -->
+    <dependency>
+      <groupId>systems.hugmesh</groupId>
+      <artifactId>hugmesh-commons</artifactId>
+    </dependency>
+
+    <!-- commons test-jar: PostgresTestSupport (Testcontainers Postgres base) for the
+         full-context (@SpringBootTest) tests migrated off the in-mem H2 dual-connection
+         that breaks under Boot 4. -->
+    <dependency>
+      <groupId>systems.hugmesh</groupId>
+      <artifactId>hugmesh-commons</artifactId>
+      <version>2.1.0</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- ============================================================================
+         The core reactive BFF stack (webflux / actuator / security /
+         oauth2-resource-server / validation), the data-access stack (data-r2dbc /
+         r2dbc-postgresql / liquibase-core / spring-jdbc / postgresql), springdoc, and
+         the whole test stack (spring-boot-starter-test / reactor-test /
+         spring-security-test / r2dbc-h2 / h2) are INHERITED from hugmesh-parent's
+         common <dependencies>. They were removed here to de-duplicate. ONLY the
+         repo-specific dependencies below remain.
+         ============================================================================ -->
+
+    <!-- CommonMark markdown -> HTML. The wiki authors markdown; the BFF renders it to
+         sanitized HTML at WRITE time and stores BOTH (content_markdown is the edit
+         source of truth; content_html is the rendered snapshot the read path / ZIM
+         (re)build serves). commonmark-ext-gfm-tables covers the GitHub-flavoured
+         tables the seeded platform docs use. PINNED — repo-specific, stays here. -->
+    <dependency>
+      <groupId>org.commonmark</groupId>
+      <artifactId>commonmark</artifactId>
+      <version>${commonmark.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.commonmark</groupId>
+      <artifactId>commonmark-ext-gfm-tables</artifactId>
+      <version>${commonmark.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build><plugins>
+    <!-- The spring-boot, native and surefire (bytebuddy-experimental argLine) plugins
+         are configured in hugmesh-parent's pluginManagement; declaring them here
+         (no config) binds the managed config. The native plugin is bound so
+         `./mvnw -Pnative native:compile` works; spring-boot repackages the app. -->
+    <plugin>
+      <groupId>org.graalvm.buildtools</groupId>
+      <artifactId>native-maven-plugin</artifactId>
+    </plugin>
+    <plugin>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-maven-plugin</artifactId>
+    </plugin>
+  </plugins></build>
+
+  <profiles>
+    <!-- Native build: `./mvnw -Pnative native:compile` produces a GraalVM binary.
+         The parent's native plugin management does the heavy lifting; this thin local
+         profile mirrors forum-bff so the same `-Pnative` invocation works. -->
+    <profile>
+      <id>native</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.graalvm.buildtools</groupId>
+            <artifactId>native-maven-plugin</artifactId>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

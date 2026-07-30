@@ -1,0 +1,979 @@
+{
+  "openapi" : "3.0.1",
+  "info" : {
+    "title" : "hugmesh-wiki-bff-api",
+    "description" : "Wiki BFF API (/bff/wiki/**) — TIER 1 of the 3-tier wiki: the writable Postgres content store (wiki_page/wiki_attachment/wiki_audit_log) the admins author markdown into. Read (list/get) gated WIKI_READ (admin|superadmin|mod+WIKI); edit (create/update, markdown->HTML at write, version bump) + publish gated WIKI_WRITE (admin|superadmin); manage gated WIKI_MANAGE (superadmin). The rendered content_html is the source the ZIM (re)build (PR4) packages for kiwix-serve (TIER 3 READ). All surfaces are domain-scoped per multi-brand: a scoped ADMIN sees only own-brand pages.",
+    "version" : "0.1.0"
+  },
+  "servers" : [ {
+    "url" : "",
+    "description" : "Generated server url"
+  } ],
+  "tags" : [ {
+    "name" : "Wiki Access",
+    "description" : "Wiki grant/timeout/ban overlay (wiki_access): grant/timeout/ban/restore (WIKI_WRITE), list-all/history (WIKI_MANAGE). Domain-scoped; enforced at request time by WikiAccessGuard."
+  }, {
+    "name" : "Wiki",
+    "description" : "Wiki BFF (TIER 1 content store): list/get (WIKI_READ), create/update/publish (WIKI_WRITE), audit (WIKI_MANAGE). Domain-scoped per brand."
+  }, {
+    "name" : "Wiki Attachments",
+    "description" : "Per-page binary attachments (wiki_attachment table). Upload/delete: ADMIN/SUPERADMIN. Download/list: USER (authenticated)."
+  } ],
+  "paths" : {
+    "/bff/wiki/admin/pages/{slug}" : {
+      "put" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Update a wiki page by slug (renders markdown->HTML, bumps version; stale expectedVersion -> 409). ADMIN/SUPERADMIN.",
+        "description" : "Update a wiki page by slug (renders markdown to HTML at write, bumps version). A stale expectedVersion (a concurrent overwrite) is a 409. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiUpdatePage",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/UpdatePage"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Updated page (markdown source + rendered HTML snapshot, bumped version).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Validation error — title or contentMarkdown failed a constraint."
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is not ADMIN or SUPERADMIN."
+          },
+          "404" : {
+            "description" : "Slug not found in the caller's brand."
+          },
+          "409" : {
+            "description" : "Stale expectedVersion — the page was concurrently modified."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      },
+      "delete" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Delete a wiki page by slug (cascades to its attachments; audited). ADMIN/SUPERADMIN.",
+        "description" : "Delete a wiki page by slug in the caller's brand. Cascades to its attachments. Audited. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiDeletePage",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "204" : {
+            "description" : "Page (and its attachments) deleted."
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is not ADMIN or SUPERADMIN."
+          },
+          "404" : {
+            "description" : "Slug not found in the caller's brand."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/pages" : {
+      "post" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Create a wiki page (renders markdown->HTML, version 1). ADMIN/SUPERADMIN.",
+        "description" : "Create a wiki page (renders markdown to HTML at write, version 1). The slug must be unique within the caller's brand. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiCreatePage",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/CreatePage"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Created page (markdown source + rendered HTML snapshot, version 1).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Validation error — slug, title, or contentMarkdown failed a constraint."
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is not ADMIN or SUPERADMIN."
+          },
+          "409" : {
+            "description" : "Slug already exists in the caller's brand."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/pages/{slug}/publish" : {
+      "post" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Publish a wiki page by slug (audited; the next ZIM rebuild packages it). ADMIN/SUPERADMIN.",
+        "description" : "Mark a wiki page as published (sets is_published=true, published_at=now()). Audited; the next ZIM rebuild will package published pages. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiPublishPage",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Confirmation body with state/slug/version.",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is not ADMIN or SUPERADMIN."
+          },
+          "404" : {
+            "description" : "Slug not found in the caller's brand."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/pages/{slug}/attachments" : {
+      "post" : {
+        "tags" : [ "Wiki Attachments" ],
+        "summary" : "Upload a binary attachment to a page (multipart/form-data; file part = 'file'). ADMIN/SUPERADMIN.",
+        "description" : "Upload a binary attachment to a page (multipart/form-data; part name = 'file'). The domain is server-derived from the caller's JWT. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiUploadAttachment",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "multipart/form-data" : {
+              "schema" : {
+                "required" : [ "file" ],
+                "type" : "object",
+                "properties" : {
+                  "file" : {
+                    "type" : "string",
+                    "format" : "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Saved attachment metadata (id, filename, mimeType, createdAt)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Missing or malformed file part"
+          },
+          "401" : {
+            "description" : "No valid JWT supplied"
+          },
+          "403" : {
+            "description" : "Not ADMIN or SUPERADMIN"
+          },
+          "404" : {
+            "description" : "Page slug not found"
+          },
+          "413" : {
+            "description" : "Attachment exceeds the configured size ceiling"
+          },
+          "500" : {
+            "description" : "Unexpected server error"
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/access/timeout" : {
+      "post" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "TIMEOUT a USER from wiki read for a bounded window (an active banned override with a future expires_at; auto-restores on expiry). ADMIN/SUPERADMIN, own-brand.",
+        "description" : "Creates (or returns existing active) a {@code banned} override row with a future {@code expires_at} computed from {@code ttlSeconds}. Once the timestamp passes, {@link WikiAccessGuard} treats the row as inactive — no write is needed on expiry. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessTimeout",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/Timeout"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Active wiki_access banned override returned (newly created or pre-existing idempotent row).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Access"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Request body validation failed (e.g. missing userSubject or non-positive ttlSeconds)."
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold ADMIN or SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error writing the override row."
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/access/grant" : {
+      "post" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "GRANT a USER permanent wiki read access (an active wiki_access read override). ADMIN/SUPERADMIN, own-brand.",
+        "description" : "Creates (or returns existing active) a {@code read} override row for the target user in the actor's brand. Idempotent: if an active {@code read} row already exists for this user in this brand it is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessGrant",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/GrantOrBan"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Active wiki_access read override returned (newly created or pre-existing idempotent row).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Access"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Request body validation failed (e.g. missing or blank userSubject)."
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold ADMIN or SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error writing the override row."
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/access/ban" : {
+      "post" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "BAN a USER from wiki read permanently (an active banned override, expires_at NULL). Denies even a role-holder/grantee. ADMIN/SUPERADMIN, own-brand.",
+        "description" : "Creates (or returns existing active) a permanent {@code banned} override row ({@code expires_at} NULL). The ban takes precedence over any role-based read permission; {@link WikiAccessGuard} denies access on every request until the row is revoked. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessBan",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/GrantOrBan"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "description" : "Active wiki_access banned override returned (newly created or pre-existing idempotent row).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Access"
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "Request body validation failed (e.g. missing or blank userSubject)."
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold ADMIN or SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error writing the override row."
+          }
+        }
+      }
+    },
+    "/bff/wiki/superadmin/audit" : {
+      "get" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Read the wiki_audit_log content-edit trail (newest first, scoped to the caller's brand; SUPERADMIN sees all). Bounded: the optional ?limit is clamped to [1, 1000] and defaults to 200. SUPERADMIN.",
+        "description" : "Read the wiki_audit_log content-edit trail (scoped to the caller's brand; SUPERADMIN sees all brands). Returns newest-first. Bounded: the optional ?limit is clamped to [1, 1000] and defaults to 200 — the read is a bounded newest-first scan, never a full-table drain. SUPERADMIN only.",
+        "operationId" : "wikiAuditTrail",
+        "parameters" : [ {
+          "name" : "limit",
+          "in" : "query",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "List of audit entries, newest first (bounded page).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is not SUPERADMIN."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/superadmin/access" : {
+      "get" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "List all ACTIVE wiki_access overrides (scoped to the caller's brand; SUPERADMIN sees all). SUPERADMIN.",
+        "description" : "Returns all currently active (non-revoked, non-expired) {@code wiki_access} rows visible to the caller. A scoped SUPERADMIN will see every brand's active overrides (the repository applies no domain filter when the actor's scope is null). Returns an empty list when no active overrides exist — never 404.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>All brands</td></tr><tr><td>ADMIN / MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessListActive",
+        "responses" : {
+          "200" : {
+            "description" : "List of active wiki_access overrides (may be an empty list when none exist).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AccessList"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error reading override rows."
+          }
+        }
+      }
+    },
+    "/bff/wiki/superadmin/access/{userSubject}/history" : {
+      "get" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "The full grant/timeout/ban HISTORY (active + revoked = audit) for a principal (scoped to the caller's brand; SUPERADMIN sees all). SUPERADMIN.",
+        "description" : "Returns all {@code wiki_access} rows (both active and revoked) for the given {@code userSubject}. Revoked rows are retained permanently for audit. Returns an empty list — never 404 — when no history exists for the subject.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>All brands</td></tr><tr><td>ADMIN / MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessHistory",
+        "parameters" : [ {
+          "name" : "userSubject",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Full audit history for the subject (active + revoked rows). Empty list when no history exists — never 404.",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/AccessList"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error reading history rows."
+          }
+        }
+      }
+    },
+    "/bff/wiki/pages" : {
+      "get" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "List wiki pages (summaries) in the caller's brand.",
+        "description" : "List wiki page summaries (no heavy content columns) in the caller's brand. The REAL read gate is WikiAccessGuard (ADMIN | SUPERADMIN | (MOD+WIKI) or an active grant, AND NOT an active ban). The gateway enforces the ROLE_WIKI route-access floor.",
+        "operationId" : "wikiListPages",
+        "responses" : {
+          "200" : {
+            "description" : "List of page summaries for the caller's brand.",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PageList"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is banned or does not hold a qualifying role or grant."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/pages/{slug}" : {
+      "get" : {
+        "tags" : [ "Wiki" ],
+        "summary" : "Get a wiki page (markdown + rendered HTML) by slug in the caller's brand.",
+        "description" : "Get a wiki page (markdown source + rendered HTML) by slug in the caller's brand. Same WikiAccessGuard gate as listPages.",
+        "operationId" : "wikiGetPage",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Full page (markdown source + rendered HTML snapshot).",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT presented."
+          },
+          "403" : {
+            "description" : "Caller is banned or does not hold a qualifying role or grant."
+          },
+          "404" : {
+            "description" : "Page not found in the caller's brand."
+          },
+          "500" : {
+            "description" : "Unexpected server error."
+          }
+        }
+      }
+    },
+    "/bff/wiki/pages/{slug}/attachments" : {
+      "get" : {
+        "tags" : [ "Wiki Attachments" ],
+        "summary" : "List attachment metadata for a page (no binary data). USER/ADMIN/SUPERADMIN via WikiAccessGuard.",
+        "description" : "List attachment metadata (filename, mimeType, createdAt — no binary data) for a page by slug in the caller's brand. Requires WIKI_READ_AUTHENTICATED + WikiAccessGuard (ADMIN | SUPERADMIN | MOD+WIKI, or an active grant; rejected if actively banned).",
+        "operationId" : "wikiListAttachments",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "List of attachment metadata (no binary data)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT supplied"
+          },
+          "403" : {
+            "description" : "Banned caller, or no qualifying role/grant"
+          },
+          "404" : {
+            "description" : "Page slug not found"
+          },
+          "500" : {
+            "description" : "Unexpected server error"
+          }
+        }
+      }
+    },
+    "/bff/wiki/pages/{slug}/attachments/{filename}" : {
+      "get" : {
+        "tags" : [ "Wiki Attachments" ],
+        "summary" : "Download a single attachment (streams the raw bytes with the stored mime type). USER/ADMIN/SUPERADMIN via WikiAccessGuard.",
+        "description" : "Download a single attachment's raw bytes for a page by slug + filename, served with the stored MIME type. Same WikiAccessGuard gate as listAttachments.",
+        "operationId" : "wikiDownloadAttachment",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        }, {
+          "name" : "filename",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Raw bytes with Content-Type set to the stored mimeType",
+            "content" : {
+              "application/octet-stream" : {
+                "schema" : {
+                  "type" : "string",
+                  "format" : "byte"
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT supplied"
+          },
+          "403" : {
+            "description" : "Banned caller, or no qualifying role/grant"
+          },
+          "404" : {
+            "description" : "Attachment not found for the given slug and filename"
+          },
+          "500" : {
+            "description" : "Unexpected server error"
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/pages/{slug}/attachments/{filename}" : {
+      "delete" : {
+        "tags" : [ "Wiki Attachments" ],
+        "summary" : "Delete an attachment from a page by filename. ADMIN/SUPERADMIN.",
+        "description" : "Delete an attachment by page slug + filename in the caller's brand. ADMIN/SUPERADMIN only.",
+        "operationId" : "wikiDeleteAttachment",
+        "parameters" : [ {
+          "name" : "slug",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        }, {
+          "name" : "filename",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Deleted confirmation map (state, slug, filename)",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "401" : {
+            "description" : "No valid JWT supplied"
+          },
+          "403" : {
+            "description" : "Not ADMIN or SUPERADMIN"
+          },
+          "404" : {
+            "description" : "Attachment not found for the given slug and filename"
+          },
+          "500" : {
+            "description" : "Unexpected server error"
+          }
+        }
+      }
+    },
+    "/bff/wiki/admin/access/{accessType}/{userSubject}" : {
+      "delete" : {
+        "tags" : [ "Wiki Access" ],
+        "summary" : "RESTORE/REVOKE: lift the active override of a type for a user (CAS active->revoked; the row is retained = audit). accessType = read|banned: revoke 'banned' to restore read; revoke 'read' to remove a grant. ADMIN/SUPERADMIN, own-brand.",
+        "description" : "CAS-transitions the active override of the given {@code accessType} to {@code revoked} state. The row is never deleted (audit retention). If no active row of that type exists for the user in the actor's brand the call is a no-op and still returns 200. {@code accessType} must be exactly {@code read} or {@code banned}; any other value yields 400.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "operationId" : "wikiAccessRevoke",
+        "parameters" : [ {
+          "name" : "accessType",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        }, {
+          "name" : "userSubject",
+          "in" : "path",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "Override revoked (or was already absent — no-op). Body contains state=revoked, accessType, userSubject.",
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "type" : "object",
+                  "additionalProperties" : {
+                    "type" : "object"
+                  }
+                }
+              }
+            }
+          },
+          "400" : {
+            "description" : "accessType path variable is not 'read' or 'banned'."
+          },
+          "401" : {
+            "description" : "No valid JWT present in the request."
+          },
+          "403" : {
+            "description" : "Caller does not hold ADMIN or SUPERADMIN role."
+          },
+          "500" : {
+            "description" : "Unexpected DB error during the CAS update."
+          }
+        }
+      }
+    }
+  },
+  "components" : {
+    "schemas" : {
+      "UpdatePage" : {
+        "required" : [ "contentMarkdown", "title" ],
+        "type" : "object",
+        "properties" : {
+          "title" : {
+            "maxLength" : 512,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "contentMarkdown" : {
+            "maxLength" : 1048576,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "expectedVersion" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "Page" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "string"
+          },
+          "domain" : {
+            "type" : "string"
+          },
+          "slug" : {
+            "type" : "string"
+          },
+          "title" : {
+            "type" : "string"
+          },
+          "contentMarkdown" : {
+            "type" : "string"
+          },
+          "contentHtml" : {
+            "type" : "string"
+          },
+          "authorSubject" : {
+            "type" : "string"
+          },
+          "version" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "updatedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "published" : {
+            "type" : "boolean"
+          },
+          "publishedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "CreatePage" : {
+        "required" : [ "contentMarkdown", "slug", "title" ],
+        "type" : "object",
+        "properties" : {
+          "slug" : {
+            "maxLength" : 512,
+            "minLength" : 0,
+            "pattern" : "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type" : "string"
+          },
+          "title" : {
+            "maxLength" : 512,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "contentMarkdown" : {
+            "maxLength" : 1048576,
+            "minLength" : 0,
+            "type" : "string"
+          }
+        }
+      },
+      "Timeout" : {
+        "required" : [ "userSubject" ],
+        "type" : "object",
+        "properties" : {
+          "userSubject" : {
+            "maxLength" : 400,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "ttlSeconds" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "reason" : {
+            "maxLength" : 1024,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "targetDomain" : {
+            "maxLength" : 64,
+            "minLength" : 0,
+            "type" : "string"
+          }
+        }
+      },
+      "Access" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "string"
+          },
+          "domain" : {
+            "type" : "string"
+          },
+          "userSubject" : {
+            "type" : "string"
+          },
+          "accessType" : {
+            "type" : "string"
+          },
+          "state" : {
+            "type" : "string"
+          },
+          "grantedBySubject" : {
+            "type" : "string"
+          },
+          "reason" : {
+            "type" : "string"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "expiresAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "revokedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "GrantOrBan" : {
+        "required" : [ "userSubject" ],
+        "type" : "object",
+        "properties" : {
+          "userSubject" : {
+            "maxLength" : 400,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "reason" : {
+            "maxLength" : 1024,
+            "minLength" : 0,
+            "type" : "string"
+          },
+          "targetDomain" : {
+            "maxLength" : 64,
+            "minLength" : 0,
+            "type" : "string"
+          }
+        }
+      },
+      "AccessList" : {
+        "type" : "object",
+        "properties" : {
+          "access" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/Access"
+            }
+          }
+        }
+      },
+      "PageList" : {
+        "type" : "object",
+        "properties" : {
+          "pages" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/PageSummary"
+            }
+          }
+        }
+      },
+      "PageSummary" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "string"
+          },
+          "slug" : {
+            "type" : "string"
+          },
+          "title" : {
+            "type" : "string"
+          },
+          "authorSubject" : {
+            "type" : "string"
+          },
+          "version" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "updatedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      }
+    }
+  }
+}

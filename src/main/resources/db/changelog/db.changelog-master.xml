@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+      Wiki BFF schema (TIER 1 — the writable content store). Liquibase runs over a
+      JDBC datasource (Liquibase has no R2DBC runner); all runtime data access goes
+      through R2DBC.
+
+        001 — wiki_page        (id app-UUID PK, domain NOT NULL, slug, title,
+              content_markdown, content_html, author_subject, version, created_at,
+              updated_at; UNIQUE(domain, slug). The rendered content_html is the source
+              of truth the ZIM (re)build packages.)
+        002 — wiki_attachment  (per-page binary attachments; page_id FK ON DELETE
+              CASCADE, filename, mime_type, data BYTEA; domain-denormalised for scoping)
+        003 — wiki_audit_log   (wiki-bff's OWN content-edit audit trail; domain-scoped
+              so a scoped admin reads only own-brand history)
+
+        004 — wiki_access      (PR3 — the grant/timeout/ban OVERLAY; desired-state cloned
+              from admin-bff access_suspension: state active->revoked never deleted=audit,
+              expires_at NULL=permanent / future=timeout-auto-restore, partial-unique on
+              active(domain,user_subject,access_type), domain-scoped. The WIKI_READ
+              enforcement guard reads this at request time.)
+
+      The ZIM-rebuild/doc-seeding pipeline (PR4) is added in a later changeset.
+    -->
+
+    <include file="db/changelog/001-wiki-page.xml"/>
+    <include file="db/changelog/002-wiki-attachment.xml"/>
+    <include file="db/changelog/003-wiki-audit-log.xml"/>
+    <include file="db/changelog/004-wiki-access.xml"/>
+    <include file="db/changelog/005-wiki-publish.xml"/>
+
+    <!--
+      006 — DB-generated UUID primary keys (org-wide migration; exemplars: mod-bff #36,
+      admin-bff #133). Adds a (gen_random_uuid())::text DEFAULT to every wiki PK
+      (wiki_page / wiki_attachment / wiki_audit_log / wiki_access) so the database — not the
+      app — mints the id; the repositories INSERT without id and read it back via RETURNING id.
+    -->
+    <include file="db/changelog/006-db-generated-uuid-pks.xml"/>
+</databaseChangeLog>

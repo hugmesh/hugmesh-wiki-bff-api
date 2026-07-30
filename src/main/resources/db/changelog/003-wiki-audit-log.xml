@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!-- wiki_audit_log: the wiki-bff's OWN audit trail — every wiki write/publish
+         action (page.create / page.update / page.publish) is recorded here regardless
+         of outcome, so the full history of who edited what (and when) is auditable. This
+         is a SEPARATE table from the mod-bff mod_action — the wiki.* mod_action mirroring
+         (for the grant/timeout/ban moderation surfacing) arrives in PR3; this table is
+         the content-edit trail.
+
+         • id            — app-generated UUID PK (portable INSERT + returnable id).
+         • domain        — the brand/tenant the action belongs to, stamped SERVER-SIDE
+                           from the actor's validated-issuer brand. A scoped ADMIN reads
+                           only own-brand audit; SUPERADMIN reads every brand's.
+         • actor_subject — the acting principal's Casdoor sub.
+         • action        — the verb (e.g. wiki.page.create / wiki.page.update /
+                           wiki.page.publish).
+         • target        — the target (page id / slug).
+         • detail        — free-text detail (nullable; e.g. the new version number).
+         • created_at    — when. -->
+    <changeSet id="003-wiki-audit-log" author="hugmesh">
+        <createTable tableName="wiki_audit_log">
+            <column name="id" type="varchar(64)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="domain" type="varchar(64)" defaultValue="default">
+                <constraints nullable="false"/>
+            </column>
+            <column name="actor_subject" type="varchar(255)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="action" type="varchar(64)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="target" type="varchar(512)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="detail" type="varchar(2000)"/>
+            <column name="created_at" type="timestamp" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+
+        <!-- The domain-scoped audit list is the hot read path for a per-brand admin
+             reading its own wiki_audit_log; index (domain, created_at) so the per-domain
+             newest-first scan does not table-scan on a busy multi-brand instance. -->
+        <createIndex tableName="wiki_audit_log" indexName="idx_wiki_audit_domain_created">
+            <column name="domain"/>
+            <column name="created_at"/>
+        </createIndex>
+    </changeSet>
+</databaseChangeLog>

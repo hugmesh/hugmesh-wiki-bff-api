@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+      wiki_access — the grant / timeout / ban OVERLAY (PR3). The DESIRED-STATE table +
+      sole source of truth for the per-principal wiki access overrides that sit ON TOP
+      of the role cascade (WIKI_READ = ADMIN|SUPERADMIN|(MOD+ROLE_WIKI)).
+
+      CLONED in SHAPE from the admin-bff access_suspension table
+      (db/changelog/008-access-suspension.xml) — the same desired-state semantics:
+
+        - state active -> revoked, the row is NEVER hard-deleted (the row IS the audit
+          trail); a re-grant/re-ban after revoke is a NEW row.
+        - expires_at NULL = PERMANENT (a permanent grant, or a permanent ban); a FUTURE
+          expires_at = a TIMEOUT that auto-restores when the clock passes WITHOUT a write
+          (the enforcement read treats expires_at<=now as "no longer active", so an
+          expired timeout simply stops denying — no expiry job needed for correctness).
+        - partial UNIQUE on (domain, user_subject, access_type) WHERE state='active' — at
+          most ONE active record of a type per (user, brand); a re-ban while active is a
+          no-op the service detects.
+        - DOMAIN-scoped: an admin acts only WITHIN their own brand (domain stamped from
+          the validated issuer); SUPERADMIN acts cross-domain.
+
+      access_type vocabulary (the read/timeout/ban model):
+        - 'read'   — a GRANT giving a USER wiki read access they would not have by role
+                     (expires_at NULL = permanent grant, future = a time-limited grant).
+        - 'banned' — a BAN denying wiki read; a TIMEOUT is just a 'banned' row with a
+                     FUTURE expires_at (auto-restores on expiry). A ban/timeout DENIES
+                     even a principal who would otherwise qualify by role or grant
+                     (the precedence enforced in WikiAccessGuard); SUPERADMIN is exempt.
+
+      ── Portable DDL ─────────────────────────────────────────────────────────
+      id is a varchar(64) holding an app-generated UUID string (the SAME pattern
+      wiki_page uses — portable across Postgres + the H2 PostgreSQL-compat slice store
+      WITHOUT a gen_random_uuid dependency, and the app returns the new row id).
+      timestamp with time zone -> the portable Liquibase generic type so the same DDL
+      applies on H2. The reserved word `state` is covered by H2 NON_KEYWORDS / is a
+      plain ALTER-friendly identifier on PG.
+
+      ── Constraints (each its own changeSet, independent redeploy + rollback) ──
+        - access_type CHECK IN ('read','banned')
+        - state       CHECK IN ('active','revoked')   [the loop flips active->revoked;
+                      never deletes — the row is the audit]
+        - uq_wiki_access_active PARTIAL UNIQUE (domain, user_subject, access_type)
+                      WHERE state='active'              [at most ONE active record per
+                      (brand,user,type); partial so revoked rows accrue as the audit]
+        - idx_wiki_access_lookup (domain, user_subject) [the enforcement read: load a
+                      principal's active rows for their brand at request time]
+    -->
+
+    <changeSet id="004-wiki-access" author="hugmesh">
+        <comment>wiki_access grant/timeout/ban overlay (desired-state; cloned from
+                 admin-bff access_suspension).</comment>
+        <createTable tableName="wiki_access">
+            <column name="id" type="varchar(64)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <!-- The brand/tenant the override belongs to, stamped SERVER-SIDE from the
+                 acting principal's validated-issuer brand (NEVER a request field). NOT
+                 NULL, DEFAULT 'default' so a single-tenant cluster carries the platform
+                 default domain. A scoped ADMIN acts only within their own brand;
+                 SUPERADMIN acts cross-domain. -->
+            <column name="domain" type="varchar(64)" defaultValue="default">
+                <constraints nullable="false"/>
+            </column>
+            <!-- The Casdoor subject the override targets (the granted/banned USER). -->
+            <column name="user_subject" type="varchar(400)">
+                <constraints nullable="false"/>
+            </column>
+            <!-- read | banned (CHECK-constrained below). -->
+            <column name="access_type" type="varchar(16)">
+                <constraints nullable="false"/>
+            </column>
+            <!-- active while in force; the service CASes it to 'revoked' on
+                 restore/revoke (the row is never deleted — it is the audit trail). -->
+            <column name="state" type="varchar(16)" defaultValue="active">
+                <constraints nullable="false"/>
+            </column>
+            <!-- The Casdoor subject of the ADMIN/SUPERADMIN who set the override. -->
+            <column name="granted_by_subject" type="varchar(400)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="reason" type="varchar(1024)"/>
+            <column name="created_at" type="timestamp with time zone" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <!-- NULL = PERMANENT; a FUTURE value = a TIMEOUT that auto-restores when the
+                 clock passes (the enforcement read treats expires_at<=now as inactive). -->
+            <column name="expires_at" type="timestamp with time zone"/>
+            <!-- Set when the row is CASed active->revoked (restore/revoke); the audit
+                 of WHEN the override was lifted. -->
+            <column name="revoked_at" type="timestamp with time zone"/>
+        </createTable>
+    </changeSet>
+
+    <changeSet id="004-wiki-access-type-check" author="hugmesh">
+        <comment>CHECK: access_type is one of the two override kinds.</comment>
+        <sql>
+            ALTER TABLE wiki_access
+                ADD CONSTRAINT ck_wiki_access_type
+                CHECK (access_type IN ('read', 'banned'))
+        </sql>
+        <rollback>ALTER TABLE wiki_access DROP CONSTRAINT ck_wiki_access_type</rollback>
+    </changeSet>
+
+    <changeSet id="004-wiki-access-state-check" author="hugmesh">
+        <comment>CHECK: state is one of the two lifecycle values the service writes.</comment>
+        <sql>
+            ALTER TABLE wiki_access
+                ADD CONSTRAINT ck_wiki_access_state
+                CHECK (state IN ('active', 'revoked'))
+        </sql>
+        <rollback>ALTER TABLE wiki_access DROP CONSTRAINT ck_wiki_access_state</rollback>
+    </changeSet>
+
+    <!--
+      The partial UNIQUE below is PARTIAL (… WHERE state='active'). PostgreSQL supports
+      partial indexes; the H2 (PG-compat) slice-test store does NOT, so it is gated with
+      a dbms=postgresql precondition (onFail=MARK_RAN) and applies only on Postgres. On
+      H2 the at-most-one-active-record-per-(domain,user,type) invariant is enforced by
+      the service (findActive-before-insert). (Mirrors the access_suspension
+      uq_access_suspension_active gating exactly.)
+    -->
+    <changeSet id="004-wiki-access-active-unique" author="hugmesh">
+        <preConditions onFail="MARK_RAN" onError="MARK_RAN">
+            <dbms type="postgresql"/>
+        </preConditions>
+        <comment>Partial UNIQUE: at most one ACTIVE override per (domain, user_subject,
+                 access_type). Revoked rows are excluded so the audit trail can hold many
+                 historical overrides for the same triple.</comment>
+        <sql>
+            CREATE UNIQUE INDEX uq_wiki_access_active
+                ON wiki_access (domain, user_subject, access_type)
+                WHERE state = 'active'
+        </sql>
+        <rollback>DROP INDEX uq_wiki_access_active</rollback>
+    </changeSet>
+
+    <changeSet id="004-wiki-access-lookup-index" author="hugmesh">
+        <comment>Index the enforcement read path (load a principal's overrides for their
+                 brand at request time).</comment>
+        <createIndex tableName="wiki_access" indexName="idx_wiki_access_lookup">
+            <column name="domain"/>
+            <column name="user_subject"/>
+        </createIndex>
+        <rollback>
+            <dropIndex tableName="wiki_access" indexName="idx_wiki_access_lookup"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

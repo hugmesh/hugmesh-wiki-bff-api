@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+      DB-GENERATED UUID PRIMARY KEYS — the org-wide migration (exemplars: merged mod-bff
+      #36, changelog 009-mod-action-db-generated-id.xml; admin-bff #133, changelog
+      200-db-generated-uuid-pks.xml).
+
+      Decision (pinned): stop minting UUID primary keys in Java
+      (UUID.randomUUID().toString()); let Postgres generate them via a column DEFAULT and
+      read the generated id back on insert (INSERT ... RETURNING id). The column type and
+      the entity @Id type are UNCHANGED — only the SOURCE of the id moves from the app to
+      the database.
+
+      Every wiki-bff PK table is a varchar(36) String @Id minted in Java as
+      UUID.randomUUID().toString(). For a varchar id the DB default casts the native uuid to
+      text — (gen_random_uuid())::text — which yields the lowercase 36-char hyphenated form,
+      BYTE-IDENTICAL to UUID.randomUUID().toString(). The column type + the entity @Id type
+      stay String; only the id SOURCE moves to the DB. Each repository INSERT omits id and
+      RETURNING id reads the generated string back (the deterministic, mod-bff-proven path).
+
+      The wiki-bff @DataR2dbcTest slices ran over an H2 PostgreSQL-compat store
+      (TestDatabaseConfig), which has neither pgcrypto/gen_random_uuid() nor a reliable
+      INSERT ... RETURNING. So these slices MOVE to the commons Testcontainers-Postgres base
+      (PostgresTestSupport, postgres:16-alpine), exactly as mod-bff #36 did: TestDatabaseConfig
+      is re-pointed at the container db and applies this production changelog over it. Reported
+      testInfra = moved-to-postgres.
+
+      Numbered 006 — a band ABOVE the current max (005-wiki-publish) in
+      db.changelog-master.xml. Registered LAST in the master.
+
+      TARGET TABLES (all varchar(36) String PK):
+        wiki_page      (001) — was WikiPageRepository.create()
+        wiki_attachment(002) — was WikiAttachmentRepository.insert()
+        wiki_audit_log (003) — was WikiAuditLogRepository.record()
+        wiki_access    (004) — was WikiAccessRepository.insertActive()
+    -->
+
+    <!-- FIRST: ensure gen_random_uuid() is available. Built-in on PG13+, but install
+         pgcrypto defensively (idempotent + harmless if already present) — mirrors the
+         mod-bff/admin-bff exemplars' pgcrypto changeSet. Gated to PostgreSQL (this repo's
+         other changesets — e.g. 004-wiki-access-active-unique — use the same dbms gate):
+         the test store IS now Postgres, and the production runtime is Postgres. -->
+    <changeSet id="006-pgcrypto-extension" author="hugmesh">
+        <preConditions onFail="MARK_RAN" onError="MARK_RAN">
+            <dbms type="postgresql"/>
+        </preConditions>
+        <comment>Install pgcrypto so gen_random_uuid() is available as the
+                 DB-generated-UUID column DEFAULT. IF NOT EXISTS — idempotent.</comment>
+        <sql>CREATE EXTENSION IF NOT EXISTS pgcrypto;</sql>
+    </changeSet>
+
+    <!-- wiki_page.id (varchar(36), changelog 001): DB-generate via (gen_random_uuid())::text
+         instead of WikiPageRepository minting UUID.randomUUID().toString(). The column stays
+         varchar(36) PK; the repository INSERT omits id and RETURNING id reads it back. -->
+    <changeSet id="006-gen-uuid-wiki_page" author="hugmesh">
+        <comment>DB-generate wiki_page.id ((gen_random_uuid())::text) instead of the app
+                 minting it; INSERT omits id, RETURNING id reads it back.</comment>
+        <addDefaultValue tableName="wiki_page" columnName="id"
+                         columnDataType="varchar(36)"
+                         defaultValueComputed="(gen_random_uuid())::text"/>
+    </changeSet>
+
+    <!-- wiki_attachment.id (varchar(36), changelog 002): DB-generate via
+         (gen_random_uuid())::text instead of WikiAttachmentRepository minting it. -->
+    <changeSet id="006-gen-uuid-wiki_attachment" author="hugmesh">
+        <comment>DB-generate wiki_attachment.id ((gen_random_uuid())::text) instead of the app
+                 minting it; INSERT omits id, RETURNING id reads it back.</comment>
+        <addDefaultValue tableName="wiki_attachment" columnName="id"
+                         columnDataType="varchar(36)"
+                         defaultValueComputed="(gen_random_uuid())::text"/>
+    </changeSet>
+
+    <!-- wiki_audit_log.id (varchar(36), changelog 003): DB-generate via
+         (gen_random_uuid())::text instead of WikiAuditLogRepository minting it. -->
+    <changeSet id="006-gen-uuid-wiki_audit_log" author="hugmesh">
+        <comment>DB-generate wiki_audit_log.id ((gen_random_uuid())::text) instead of the app
+                 minting it; INSERT omits id, RETURNING id reads it back.</comment>
+        <addDefaultValue tableName="wiki_audit_log" columnName="id"
+                         columnDataType="varchar(36)"
+                         defaultValueComputed="(gen_random_uuid())::text"/>
+    </changeSet>
+
+    <!-- wiki_access.id (varchar(36), changelog 004): DB-generate via (gen_random_uuid())::text
+         instead of WikiAccessRepository minting it. The never-delete/CAS active->revoked
+         audit semantics + the partial-unique (domain,user_subject,access_type) WHERE
+         state='active' backstop are UNCHANGED — only the id source moves to the DB. -->
+    <changeSet id="006-gen-uuid-wiki_access" author="hugmesh">
+        <comment>DB-generate wiki_access.id ((gen_random_uuid())::text) instead of the app
+                 minting it; INSERT omits id, RETURNING id reads it back.</comment>
+        <addDefaultValue tableName="wiki_access" columnName="id"
+                         columnDataType="varchar(36)"
+                         defaultValueComputed="(gen_random_uuid())::text"/>
+    </changeSet>
+
+</databaseChangeLog>

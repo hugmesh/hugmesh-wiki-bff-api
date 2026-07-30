@@ -1,0 +1,113 @@
+spring:
+  application:
+    name: hugmesh-wiki-bff-api
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: "${CASDOOR_ISSUER_URI:https://id.hugmesh.systems}"
+
+  # Runtime data access is REACTIVE (R2DBC) over the wiki-bff content store: the
+  # wiki_page / wiki_attachment / wiki_audit_log tables (TIER 1, WRITE).
+  r2dbc:
+    url: "${SPRING_R2DBC_URL:r2dbc:postgresql://wiki-bff-db.hugmesh-backend.svc.cluster.local:5432/wikibff}"
+    username: "${SPRING_R2DBC_USERNAME:wikibff}"
+    password: "${SPRING_R2DBC_PASSWORD:}"
+
+  # Multipart upload ceilings (defence-in-depth for the binary attachment surface,
+  # POST /bff/wiki/admin/pages/{slug}/attachments). The handler ALSO enforces an
+  # explicit per-attachment byte cap (app.wiki.attachment.max-bytes) via a bounded
+  # DataBufferUtils.join → 413; these server-level limits reject oversize parts even
+  # earlier and bound any disk spill. max-in-memory-size is kept small so a part is
+  # streamed (not heap-buffered) before the handler's bounded join takes over.
+  webflux:
+    multipart:
+      max-in-memory-size: "256KB"
+      max-disk-usage-per-part: "26MB"
+      max-parts: 16
+
+  # Liquibase owns schema migrations. It has NO R2DBC runner, so it uses a plain
+  # JDBC datasource — the ONLY JDBC use in the app; all runtime access is R2DBC.
+  liquibase:
+    enabled: true
+    change-log: "classpath:db/changelog/db.changelog-master.xml"
+    url: "${SPRING_LIQUIBASE_URL:jdbc:postgresql://wiki-bff-db.hugmesh-backend.svc.cluster.local:5432/wikibff}"
+    user: "${SPRING_LIQUIBASE_USER:wikibff}"
+    password: "${SPRING_LIQUIBASE_PASSWORD:}"
+
+# SpringDoc OpenAPI. The spec at /v3/api-docs is the source the platform
+# ng-openapi-gen typed client (the paired hugmesh-wiki-ui (shipped)) + the docs pipeline
+# consume. Spec + UI are gated by SecurityConfig: permitAll under dev/test (so
+# `gen:fetch` can curl the spec without a token) and ROLE_ADMIN otherwise (prod).
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+    version: openapi_3_0
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+  # Restrict the component scan to this BFF's own controllers so the spec stays the
+  # wiki-BFF surface only (no stray springframework/actuator paths leak in).
+  packages-to-scan: systems.hugmesh.wikibff
+  # Pin the DEFAULT response media type to application/json. REQUIRED for the paired
+  # ng-openapi-gen typed client: without it springdoc emits `*/*` for handlers that
+  # declare no explicit `produces`, which ng-openapi-gen maps to `Blob` and so breaks
+  # JSON parsing of every JSON response. The binary download endpoint sets its
+  # Content-Type at RUNTIME (the stored attachment mime type) and is unaffected by
+  # this default; this only renames the otherwise-empty `*/*` to `application/json`.
+  default-produces-media-type: application/json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+server:
+  port: 8080
+  # ── API-to-API mTLS enforcement (server side) ──────────────────────────────
+  # When the in-cluster keystore initContainer is mounted (PKCS12 keystore.p12 =
+  # this service's Vault-PKI identity + truststore.p12 = the cluster CA), the
+  # deployment flips these on so the TLS handshake REQUIRES a client cert that chains
+  # to the cluster CA. A caller that was NOT deployed+signed by our Vault/ESO PKI
+  # process holds no such cert, so its handshake is rejected.
+  #
+  # Defaults keep local/dev/CI working: ssl.enabled=false (plaintext) and
+  # client-auth=none, so the truststore is never opened and existing tests are
+  # unaffected. In-cluster, the deployment sets SSL_ENABLED=true,
+  # SSL_CLIENT_AUTH=need and points the key-store/trust-store at the mounted PKCS12
+  # stores. The store passwords are generated in-pod and injected via env.
+  ssl:
+    enabled: "${SSL_ENABLED:false}"
+    client-auth: "${SSL_CLIENT_AUTH:none}"
+    key-store: "${SSL_KEY_STORE:/stores/keystore.p12}"
+    key-store-type: "${SSL_KEY_STORE_TYPE:PKCS12}"
+    key-store-password: "${SSL_KEY_STORE_PASSWORD:}"
+    trust-store: "${SSL_TRUST_STORE:/stores/truststore.p12}"
+    trust-store-type: "${SSL_TRUST_STORE_TYPE:PKCS12}"
+    trust-store-password: "${SSL_TRUST_STORE_PASSWORD:}"
+    # TLSv1.3 floor (forward-secret, AEAD-only) — matches the gateway chart.
+    enabled-protocols: "${SSL_ENABLED_PROTOCOLS:TLSv1.3}"
+
+app:
+  # Binary-attachment upload ceiling. The WikiAttachmentController enforces this as an
+  # explicit per-attachment byte cap via a bounded DataBufferUtils.join: a part past the
+  # ceiling overflows the join and is rejected with 413 (never accumulated in heap). The
+  # store is inline BYTEA, so this also bounds every later in-heap download. Default 25 MiB
+  # (this literal is the fallback for WikiAttachmentController's constructor-injected
+  # `maxAttachmentBytes` field). Keep ≤ spring.webflux.multipart.max-disk-usage-per-part
+  # above so the server-level limit stays the outer guard.
+  wiki:
+    attachment:
+      max-bytes: "${APP_WIKI_ATTACHMENT_MAX_BYTES:26214400}"
+
+  # Per-brand Casdoor issuers for multi-tenant mode. OPT-IN: empty = single-issuer.
+  # Format: comma-separated issuerUri=domainName pairs.
+  # When non-empty, TenancyResourceServerConfig activates; unknown issuers → 401.
+  tenancy:
+    issuers: "${APP_TENANCY_ISSUERS:}"

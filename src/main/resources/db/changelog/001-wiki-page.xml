@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!-- wiki_page: TIER 1 (WRITE) content store. Admins author markdown; the BFF
+         renders it to HTML at WRITE time and stores BOTH — content_markdown is the
+         edit source of truth, content_html is the rendered snapshot the read path /
+         ZIM (re)build (PR4) serves. The rendered HTML is the SOURCE OF TRUTH the ZIM
+         packaging consumes.
+
+         • id          — app-generated UUID PK (the INSERT is portable across Postgres
+                         + H2 and the new row's id is returned by the repository).
+         • domain      — the brand/tenant the page belongs to, stamped SERVER-SIDE from
+                         the author's validated-issuer brand (NEVER a request field).
+                         NOT NULL, DEFAULT 'default' so a single-tenant cluster carries
+                         the platform default domain unchanged. A scoped ADMIN of brand
+                         X reads only brand X's pages; SUPERADMIN is unscoped.
+         • slug        — the URL-stable page key WITHIN a brand. UNIQUE(domain, slug):
+                         the same slug may exist independently per brand; collisions are
+                         a 409 within a brand.
+         • author_subject — the immutable Casdoor sub of the last author (owner track),
+                         set from the JWT, never the request body. Seeded docs carry
+                         '@system'.
+         • version     — optimistic-concurrency / history counter, bumped on every
+                         write; the edit endpoint accepts an expected version so a stale
+                         edit is a 409.
+
+         varchar over text for portability; content columns are large varchar so the
+         same DDL runs on Postgres AND the H2 PostgreSQL-compat slice DB. -->
+    <changeSet id="001-wiki-page" author="hugmesh">
+        <createTable tableName="wiki_page">
+            <column name="id" type="varchar(64)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="domain" type="varchar(64)" defaultValue="default">
+                <constraints nullable="false"/>
+            </column>
+            <column name="slug" type="varchar(512)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="title" type="varchar(512)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="content_markdown" type="varchar(1048576)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="content_html" type="varchar(2097152)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="author_subject" type="varchar(255)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="version" type="bigint" defaultValueNumeric="1">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="timestamp" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="timestamp" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+
+        <!-- The slug is unique WITHIN a brand (the same slug may exist per brand); the
+             (domain, slug) read is the hot path for the get-by-slug lookup. -->
+        <addUniqueConstraint tableName="wiki_page" columnNames="domain, slug"
+                             constraintName="uq_wiki_page_domain_slug"/>
+        <!-- The per-brand page list (newest first) is the hot read path for a scoped
+             admin browsing its own brand's pages; index (domain, updated_at) so it does
+             not table-scan on a busy multi-brand instance. -->
+        <createIndex tableName="wiki_page" indexName="idx_wiki_page_domain_updated">
+            <column name="domain"/>
+            <column name="updated_at"/>
+        </createIndex>
+    </changeSet>
+</databaseChangeLog>

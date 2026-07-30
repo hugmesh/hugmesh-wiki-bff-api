@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!-- wiki_attachment: per-page binary attachments (images / files) authored into a
+         wiki page. The data is stored inline as a BYTEA blob so the content store is a
+         single source of truth the ZIM (re)build (PR4) packages alongside the page HTML
+         — no separate object-store dependency on the default-on Pi path.
+
+         • id        — app-generated UUID PK (portable INSERT + returnable id).
+         • page_id   — FK to wiki_page.id; ON DELETE CASCADE so deleting a page reaps its
+                       attachments.
+         • domain    — denormalised brand/tenant copy (= the owning page's domain), so an
+                       attachment read is domain-scopable WITHOUT a join, matching the
+                       page scoping. Stamped from the owning page at write time.
+         • filename  — the display/download name.
+         • mime_type — the content type served back on download.
+         • data      — the raw bytes (BYTEA — H2's PostgreSQL-compat MODE understands
+                       BYTEA too, so the same DDL runs on both). -->
+    <changeSet id="002-wiki-attachment" author="hugmesh">
+        <createTable tableName="wiki_attachment">
+            <column name="id" type="varchar(64)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="page_id" type="varchar(64)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="domain" type="varchar(64)" defaultValue="default">
+                <constraints nullable="false"/>
+            </column>
+            <column name="filename" type="varchar(512)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="mime_type" type="varchar(255)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="data" type="BYTEA">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="timestamp" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+
+        <addForeignKeyConstraint baseTableName="wiki_attachment" baseColumnNames="page_id"
+                                 constraintName="fk_wiki_attachment_page"
+                                 referencedTableName="wiki_page" referencedColumnNames="id"
+                                 onDelete="CASCADE"/>
+        <!-- The per-page attachment list is the hot read path when rendering a page. -->
+        <createIndex tableName="wiki_attachment" indexName="idx_wiki_attachment_page">
+            <column name="page_id"/>
+        </createIndex>
+    </changeSet>
+</databaseChangeLog>

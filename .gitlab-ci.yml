@@ -1,0 +1,128 @@
+# HugMesh CI — build + push this service's container image to the in-cluster
+# GitLab container registry. The GitHub repo is pull-mirrored into in-cluster
+# GitLab (mirror_trigger_builds=true), so this runs on push / mirror-sync on the
+# privileged x86 runner (shell executor with docker, matching the generator CI).
+# Images carry NO keys — KEYS material is supplied from the USB at first boot.
+#
+# Pen-test (OWASP SCA + authenticated ZAP DAST) is pulled in from the CENTRALIZED,
+# single-source-of-truth stage template in hugmesh-generator (see memory
+# hugmesh-pentest-standard + hugmesh-nuclei-integration). The previously
+# inline `dependency-check` / `zap-api-scan` jobs (P2-1) are MIGRATED to `extends:`
+# the hidden `.pentest-sca` / `.pentest-dast-baseline` jobs so the FULL harness
+# (Dependency-Check SCA + ZAP baseline + custom escalation/DoS probes + nuclei)
+# runs from one place; they keep allow_failure (advisory, non-gating) + this repo's
+# default-branch + merge_request rules.
+include:
+  - project: 'HugMesh/hugmesh-generator'
+    ref: main
+    file: '/tests/pentest/ci/pentest-stage.gitlab-ci.yml'
+
+# The inline `dependency-check` (stage: security) / `zap-api-scan` (stage: dast) jobs
+# this repo used to run were MIGRATED to the centralized `pentest:sca` / `pentest:dast`
+# jobs above (stage: pentest, from the included template) — the old `security`/`dast`
+# stage names are no longer referenced by any job in this file and have been dropped.
+stages: [test, pentest, build]
+
+# -----------------------------------------------------------------------------
+# Maven test stage. Spring Boot 4 moved the full-context (@SpringBootTest) tests
+# onto a REAL Postgres via Testcontainers (the commons PostgresTestSupport base) —
+# the in-mem dual-handle H2 stopped sharing a store under Boot 4 — so this job needs
+# a Docker daemon, attached here as a docker:dind service (mirrors federation #43).
+#
+#   * DOCKER_HOST / DOCKER_TLS_CERTDIR / DOCKER_CERT_PATH / DOCKER_TLS_VERIFY:
+#     reach the dind service over its default TLS socket.
+#   * TESTCONTAINERS_HOST_OVERRIDE=docker: the address spawned containers (and the
+#     Liquibase/r2dbc clients) reach the dind host on.
+#   * TESTCONTAINERS_RYUK_DISABLED=true: dind is torn down with the job, so the Ryuk
+#     reaper is redundant (and is unreliable in nested-docker CI).
+#   * MAVEN_OPTS=-Dapi.version=1.43: docker-java's strategy ping defaults to Docker
+#     API 1.32, which a modern daemon (min API 1.40) rejects — pin it >= 1.40.
+#
+# hugmesh-commons / hugmesh-parent are PRIVATE (org GitLab Maven registry), not
+# on Maven Central. The committed settings.xml declares the gitlab-maven group
+# registry; auth is the job-scoped CI_JOB_TOKEN GitLab injects. CI_API_V4_URL is a
+# predefined GitLab var; GITLAB_GROUP_ID must be set as a CI/CD or group variable
+# (the HugMesh group id). No secret is committed — only ${env.*} refs.
+# -----------------------------------------------------------------------------
+test:
+  stage: test
+  tags: [hugmesh-x86, privileged]
+  image: maven:3.9-eclipse-temurin-25
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_TLS_VERIFY: "1"
+    TESTCONTAINERS_HOST_OVERRIDE: "docker"
+    TESTCONTAINERS_RYUK_DISABLED: "true"
+    MAVEN_OPTS: "-Dapi.version=1.43"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - ./mvnw -B -s settings.xml test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+    paths:
+      - target/surefire-reports/
+    expire_in: 7 days
+
+build:image:
+  stage: build
+  needs: [test]
+  tags: [hugmesh-x86, privileged]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  variables:
+    # BuildKit is required for the Dockerfile's `--mount=type=secret` private-dep
+    # resolution (hugmesh-commons from the GitLab Maven registry).
+    DOCKER_BUILDKIT: "1"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # Immutable tag = release tag or git SHA; plus a moving branch tag the deploy/
+    # kustomize can track for dev.
+    - export TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    # CI_JOB_TOKEN is passed as a BuildKit SECRET (never persisted in a layer); the
+    # GitLab registry coordinates go in as build-args so the committed settings.xml
+    # can resolve the PRIVATE hugmesh-commons artifact during `./mvnw package`
+    # inside the build stage. GITLAB_GROUP_ID must be set to the HugMesh
+    # group id (a CI/CD or group variable).
+    - |
+      docker build --pull \
+        --secret id=ci_job_token,env=CI_JOB_TOKEN \
+        --build-arg CI_API_V4_URL="$CI_API_V4_URL" \
+        --build-arg GITLAB_GROUP_ID="$GITLAB_GROUP_ID" \
+        -t "$CI_REGISTRY_IMAGE:$TAG" -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" .
+    - docker push "$CI_REGISTRY_IMAGE:$TAG"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+
+# pentest:sca — MIGRATED from the inline `dependency-check` job to the centralized
+# `.pentest-sca` (OWASP Dependency-Check over this repo). The template's image,
+# script, NVD cache + SARIF/HTML/JSON artifacts are inherited; we keep allow_failure
+# (advisory) + mirror this repo's existing security-job rules.
+pentest:sca:
+  extends: .pentest-sca
+  needs: [test]
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# pentest:dast — MIGRATED from the inline `zap-api-scan` job to the centralized
+# `.pentest-dast-baseline`, which drives the SHARED harness (run-pentest.sh: env-
+# test-build stand-up, persona-seeded authenticated ZAP baseline, custom probes +
+# nuclei). allow_failure keeps it advisory; rules mirror this repo's security jobs.
+pentest:dast:
+  extends: .pentest-dast-baseline
+  needs: [test]
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
