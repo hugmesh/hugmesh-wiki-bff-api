@@ -26,9 +26,9 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
 
 - **Dependency baseline:** Spring Boot **4.0.7** / Spring Cloud **2025.1.2**, **Java 25
   LTS** (`eclipse-temurin:25`), on the shared Maven artifacts
-  `systems.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh-net/hugmesh-parent))
-  and `systems.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
-  `systems.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The full
+  `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh-net/hugmesh-parent))
+  and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
+  `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The full
   suite is green: **239/239 tests**, run against a real Postgres via Testcontainers rather
   than an in-memory substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
@@ -385,7 +385,7 @@ Tests follow the platform's standard categories:
 This service adopts the platform's shared Maven artifacts, removing duplicated security and
 tenancy code. There are two de-duplication moves:
 
-1. **Parent POM →** `systems.hugmesh:hugmesh-parent:2.8.0` (itself a child of
+1. **Parent POM →** `net.hugmesh:hugmesh-parent:2.8.0` (itself a child of
    `spring-boot-starter-parent:4.0.7`, so the whole Spring Boot dependency/plugin
    management is inherited transitively). The parent consolidates the reactive-BFF
    `<dependencies>` (webflux/actuator/security/oauth2-resource-server/validation,
@@ -393,7 +393,7 @@ tenancy code. There are two de-duplication moves:
    `dependencyManagement` for `hugmesh-commons`. Only the **wiki-specific** dependencies
    stay in this POM: `commonmark` + `commonmark-ext-gfm-tables`.
 
-2. **Shared security/tenancy/web →** `systems.hugmesh:hugmesh-commons:2.1.0`.
+2. **Shared security/tenancy/web →** `net.hugmesh:hugmesh-commons:2.1.0`.
    The local copies of `security.{Roles,CasdoorAuthorities,DomainRegistry,DomainScope}`,
    `config.TenancyResourceServerConfig`, and `web.ApiException` were deleted and replaced
    by the commons equivalents:
@@ -417,7 +417,7 @@ tenancy code. There are two de-duplication moves:
 
    **Consumer-wiring step:** `config.CommonsSecurityConfig` `@Import`s the commons
    `DomainRegistry` + `TenancyResourceServerConfig` beans (the `@SpringBootApplication`
-   scan over `systems.hugmesh.wikibff` does not cover `systems.hugmesh.commons.*`). The
+   scan over `net.hugmesh.wikibff` does not cover `net.hugmesh.commons.*`). The
    `@Import` preserves `TenancyResourceServerConfig`'s `@ConditionalOnExpression` gate.
 
 ### Resolving the private `hugmesh-commons` artifact
