@@ -34,7 +34,7 @@ jobs:
         id: vars
         run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
-      # This service depends on the private systems.hugmesh:hugmesh-commons artifact
+      # This service depends on the private net.hugmesh:hugmesh-commons artifact
       # (see settings.xml), historically resolved in CI from the org's GitLab Maven
       # Package Registry using a job-scoped CI_JOB_TOKEN (see .gitlab-ci.yml). That
       # token has no GitHub equivalent, so it must be supplied as a repo secret

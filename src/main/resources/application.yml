@@ -49,7 +49,7 @@ springdoc:
     path: /swagger-ui.html
   # Restrict the component scan to this BFF's own controllers so the spec stays the
   # wiki-BFF surface only (no stray springframework/actuator paths leak in).
-  packages-to-scan: systems.hugmesh.wikibff
+  packages-to-scan: net.hugmesh.wikibff
   # Pin the DEFAULT response media type to application/json. REQUIRED for the paired
   # ng-openapi-gen typed client: without it springdoc emits `*/*` for handlers that
   # declare no explicit `produces`, which ng-openapi-gen maps to `Blob` and so breaks
