@@ -47,7 +47,7 @@
          security.PrincipalDomain (@Component, forScope/__deny__ fail-closed scope
          resolver — NOT the commons PrincipalDomain value object) stays per-repo. -->
     <dependency>
-      <groupId>systems.hugmesh</groupId>
+      <groupId>net.hugmesh</groupId>
       <artifactId>hugmesh-commons</artifactId>
     </dependency>
 
@@ -55,7 +55,7 @@
          full-context (@SpringBootTest) tests migrated off the in-mem H2 dual-connection
          that breaks under Boot 4. -->
     <dependency>
-      <groupId>systems.hugmesh</groupId>
+      <groupId>net.hugmesh</groupId>
       <artifactId>hugmesh-commons</artifactId>
       <version>2.1.0</version>
       <classifier>tests</classifier>
