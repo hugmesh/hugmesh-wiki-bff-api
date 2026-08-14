@@ -5,7 +5,7 @@ spring:
     oauth2:
       resourceserver:
         jwt:
-          issuer-uri: "${CASDOOR_ISSUER_URI:https://id.hugmesh.systems}"
+          issuer-uri: "${CASDOOR_ISSUER_URI:https://id.hugmesh.net}"
           # Explicit JWKS so the resource server does NOT do OIDC discovery against
           # issuer-uri. On the local compose stack the issuer is the PUBLISHED
           # http://localhost:8000 (what the browser token carries in `iss`), but
@@ -15,7 +15,7 @@ spring:
           # the logs. mod-bff hit and documented this first; this BFF never copied
           # the fix. iss is still validated via issuer-uri. Compose supplies
           # CASDOOR_JWKS_URI=http://casdoor:8000/.well-known/jwks.
-          jwk-set-uri: "${CASDOOR_JWKS_URI:${CASDOOR_ISSUER_URI:https://id.hugmesh.systems}/.well-known/jwks}"
+          jwk-set-uri: "${CASDOOR_JWKS_URI:${CASDOOR_ISSUER_URI:https://id.hugmesh.net}/.well-known/jwks}"
 
   # Runtime data access is REACTIVE (R2DBC) over the wiki-bff content store: the
   # wiki_page / wiki_attachment / wiki_audit_log tables (TIER 1, WRITE).
