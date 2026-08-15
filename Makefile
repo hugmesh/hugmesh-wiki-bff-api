@@ -19,7 +19,7 @@ JAVA_IMAGE        ?= eclipse-temurin:25-jdk-noble
 # Where the shared DAST harness lives. Defaults to a sibling checkout of the
 # generator; override to a vendored/cloned copy.
 PENTEST_HARNESS_DIR ?= ../hugmesh-generator/tests/pentest
-GENERATOR_REPO      ?= https://github.com/hugmesh-net/hugmesh-generator.git
+GENERATOR_REPO      ?= https://github.com/hugmesh/hugmesh-generator.git
 
 .PHONY: pentest pentest-sca pentest-dast
 
