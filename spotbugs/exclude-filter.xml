@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Repo-local SpotBugs exclude filter for hugmesh-wiki-bff-api.
+
+  ADDITIVE, not a replacement. hugmesh-parent configures
+  <excludeFilterFile>hugmesh/spotbugs-exclude.xml</excludeFilterFile> (the shared
+  hugmesh-build-config baseline); this file is wired through the SEPARATE
+  <excludeFilterFiles> parameter in pom.xml, which the spotbugs plugin applies IN
+  ADDITION to it. The shared baseline therefore still governs everything it covers —
+  the only thing that lives here is the one suppression it cannot express.
+-->
+<FindBugsFilter>
+
+  <!-- WikiAccessGuard is a plain Spring @Component whose constructor stores two
+       injected singleton collaborators (WikiAccessRepository, PrincipalDomain) into
+       final fields — textbook constructor injection. A "defensive copy" of an injected
+       bean is meaningless, so EI_EXPOSE_REP2 here is a false positive.
+
+       WHY THE SHARED FILTER MISSES IT: hugmesh-build-config suppresses exactly this
+       pattern, but only for a LAYER package (…​.service/.controller/…) or a class whose
+       name ends in Service|Controller|Repository|Client|Config|Handler|Filter|Resolver.
+       This repo is organised by FEATURE (net.hugmesh.wikibff.access) and the class is a
+       *Guard*, so neither shared rule matches. Broadening the fleet-wide filter for one
+       class would silently mute every future *Guard in every repo; scoping it to this
+       one class here does not.
+
+       GUARD (mirrors the build-config rule): only the injected-collaborator FP is
+       suppressed. If a genuinely mutable DATA field is ever stored on this guard — key
+       material (byte[]/char[]) or a mutable collection/date — that finding is REAL and
+       is still reported. -->
+  <Match>
+    <Class name="net.hugmesh.wikibff.access.WikiAccessGuard"/>
+    <Bug pattern="EI_EXPOSE_REP2"/>
+    <Not>
+      <Or>
+        <!-- Secret-shaped: caller-supplied key / token / password material. -->
+        <Field type="byte[]"/>
+        <Field type="char[]"/>
+        <!-- Mutable data carriers stored by reference. -->
+        <Field type="java.util.List"/>
+        <Field type="java.util.Map"/>
+        <Field type="java.util.Set"/>
+        <Field type="java.util.Collection"/>
+        <Field type="java.util.Date"/>
+      </Or>
+    </Not>
+  </Match>
+
+</FindBugsFilter>

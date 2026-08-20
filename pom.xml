@@ -102,6 +102,23 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-maven-plugin</artifactId>
     </plugin>
+    <!-- PMD / Checkstyle / SpotBugs all bind at `verify` from hugmesh-parent's own
+         <build><plugins>, so they are inherited with NO declaration here. This block
+         adds ONE thing: a repo-local exclude filter. <excludeFilterFiles> is a separate
+         parameter from the parent's <excludeFilterFile>, and the plugin applies both,
+         so the shared hugmesh-build-config baseline is kept rather than replaced. The
+         local file carries a single, class-scoped EI_EXPOSE_REP2 suppression the shared
+         class-name-suffix rule cannot reach — see spotbugs/exclude-filter.xml for the
+         justification. -->
+    <plugin>
+      <groupId>com.github.spotbugs</groupId>
+      <artifactId>spotbugs-maven-plugin</artifactId>
+      <configuration>
+        <excludeFilterFiles>
+          <excludeFilterFile>${project.basedir}/spotbugs/exclude-filter.xml</excludeFilterFile>
+        </excludeFilterFiles>
+      </configuration>
+    </plugin>
   </plugins></build>
 
   <profiles>

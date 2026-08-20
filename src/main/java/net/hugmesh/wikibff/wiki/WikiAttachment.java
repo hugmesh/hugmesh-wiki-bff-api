@@ -54,6 +54,17 @@ public record WikiAttachment(
         @Column("created_at")
         Instant createdAt) {
 
+    /**
+     * Defensive copy on the way IN. The accessor below already copies on the way OUT,
+     * but a record's canonical constructor still stores the CALLER's array by reference
+     * — an uploader that kept its {@code byte[]} could still mutate this row's bytes
+     * afterwards (EI_EXPOSE_REP2). Costs one extra copy per row materialised; see the
+     * BYTEA size concern on the class Javadoc.
+     */
+    public WikiAttachment {
+        data = data.clone();
+    }
+
     @Override
     public byte[] data() {
         return data.clone();

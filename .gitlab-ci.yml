@@ -24,7 +24,13 @@ include:
 stages: [test, pentest, build]
 
 # -----------------------------------------------------------------------------
-# Maven test stage. Spring Boot 4 moved the full-context (@SpringBootTest) tests
+# Maven test stage. Runs `verify`, NOT `test`: PMD, Checkstyle and SpotBugs are all
+# configured by hugmesh-parent and bind at the `verify` phase, so a job that stops at
+# `test` never runs them and the three analysers gate nothing (the image build only runs
+# `package -DskipTests`, so it does not reach them either). `verify` runs the same test
+# suite and then the analysers, matching the mod-bff / mesh-bff / user-bff exemplars.
+#
+# Spring Boot 4 moved the full-context (@SpringBootTest) tests
 # onto a REAL Postgres via Testcontainers (the commons PostgresTestSupport base) —
 # the in-mem dual-handle H2 stopped sharing a store under Boot 4 — so this job needs
 # a Docker daemon, attached here as a docker:dind service (mirrors federation #43).
@@ -64,7 +70,7 @@ test:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_TAG'
   script:
-    - ./mvnw -B -s settings.xml test
+    - ./mvnw -B -s settings.xml verify
     # ANY TEST THAT REGENERATES A COMMITTED ARTEFACT PASSES BY REWRITING IT, and in a
     # throwaway CI workspace nobody ever sees the diff. OpenApiSpecDumpTest used to do exactly
     # that with src/main/resources/openapi/openapi.json: it wrote by default and asserted only
