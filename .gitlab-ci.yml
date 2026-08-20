@@ -13,7 +13,7 @@
 # runs from one place; they keep allow_failure (advisory, non-gating) + this repo's
 # default-branch + merge_request rules.
 include:
-  - project: 'HugMesh/hugmesh-generator'
+  - project: 'hugmesh/hugmesh-generator'
     ref: main
     file: '/tests/pentest/ci/pentest-stage.gitlab-ci.yml'
 
