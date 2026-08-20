@@ -58,6 +58,17 @@ public final class WikiAccessDto {
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record AccessList(List<Access> access) {
+        /**
+         * Defensive copy on the way IN. The accessor below already copies on the way OUT,
+         * but a record's canonical constructor still stores the CALLER's list by reference
+         * — a caller that kept and mutated it would mutate this record (EI_EXPOSE_REP2).
+         * Copying here makes the field immutable at rest (which in turn makes the
+         * accessor's {@code copyOf} a no-op returning the same instance).
+         */
+        public AccessList {
+            access = List.copyOf(access);
+        }
+
         @Override
         public List<Access> access() {
             return List.copyOf(access);
