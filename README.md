@@ -136,7 +136,7 @@ audit trail are all on `main`.
 - **`WikiAccessController` + `WikiAccessGuard`** — the grant/timeout/ban overlay, enforced
   at request time on every read.
 - **OpenAPI / springdoc** at `/v3/api-docs` — the source for the paired
-  [`hugmesh-wiki-ui`](https://github.com/hugmesh-net/hugmesh-wiki-ui) (✅ shipped:
+  [`hugmesh-wiki-ui`](https://github.com/hugmesh/hugmesh-wiki-ui) (✅ shipped:
   ng-openapi-gen typed client, Playwright/BDD e2e harness, Dockerfile+nginx, CI pipeline;
   its federation contract is wired to this BFF's `/v3/api-docs`).
 
@@ -470,7 +470,7 @@ The items below are clearly marked future work. **None of this is shipped in thi
 - 🔭 **TIER 3 — `kiwix-serve` read path** (out of repo): mounts the PVC read-only and
   serves it (never the write path). Kiwix has no native auth, so the gateway is its
   authorization.
-- ✅ **[`hugmesh-wiki-ui`](https://github.com/hugmesh-net/hugmesh-wiki-ui)** (out of repo,
+- ✅ **[`hugmesh-wiki-ui`](https://github.com/hugmesh/hugmesh-wiki-ui)** (out of repo,
   shipped on main): the paired Angular client — ng-openapi-gen typed client generated from
   this BFF's `/v3/api-docs`, federation contract wired, Playwright/BDD e2e harness,
   Dockerfile+nginx, CI pipeline.
