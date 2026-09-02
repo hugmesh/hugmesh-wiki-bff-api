@@ -110,6 +110,68 @@ public final class WikiDto {
         }
     }
 
+    // ── audit trail (WIKI_MANAGE) ──────────────────────────────────────
+
+    /**
+     * One row of the {@code wiki_audit_log} content-edit trail, as it crosses the HTTP
+     * boundary. Field-for-field identical to the {@link WikiAuditLog} row it is built
+     * from — the point of the DTO is not to reshape the JSON (the wire form is unchanged)
+     * but to give the response a NAMED schema, so springdoc emits a real
+     * {@code AuditEntry} component instead of an open {@code additionalProperties} object
+     * and the ng-openapi-gen clients get a typed model rather than
+     * {@code Record<string, unknown>}.
+     *
+     * @param id           the DB-generated UUID primary key of the audit row
+     * @param domain       the brand/tenant the action belongs to (server-derived)
+     * @param actorSubject the acting principal's Casdoor {@code sub}
+     * @param action       the action verb (e.g. {@code wiki.page.create})
+     * @param target       the target (page slug)
+     * @param detail       free-text detail; {@code null} when the action recorded none
+     * @param createdAt    when the action occurred
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record AuditEntry(String id, String domain, String actorSubject, String action,
+                             String target, String detail, Instant createdAt) {
+        /**
+         * Construct an {@link AuditEntry} from a {@link WikiAuditLog} row.
+         *
+         * @param r the source {@link WikiAuditLog}
+         * @return an {@link AuditEntry} populated from {@code r}
+         */
+        public static AuditEntry of(WikiAuditLog r) {
+            return new AuditEntry(r.id(), r.domain(), r.actorSubject(), r.action(),
+                    r.target(), r.detail(), r.createdAt());
+        }
+    }
+
+    /**
+     * The audit-trail response wrapper — {@code {"actions": [...]}}, newest first. The
+     * key name {@code actions} is the pre-existing wire contract (this used to be an
+     * untyped {@code Map.of("actions", …)}); only the SCHEMA changed, never the JSON.
+     *
+     * @param actions the bounded, newest-first list of {@link AuditEntry} rows for the
+     *                caller's scope (a scoped ADMIN never reaches this surface;
+     *                SUPERADMIN sees every brand)
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record AuditList(List<AuditEntry> actions) {
+        /**
+         * Defensive copy on the way IN. The accessor below already copies on the way OUT,
+         * but a record's canonical constructor still stores the CALLER's list by reference
+         * — a caller that kept and mutated it would mutate this record (EI_EXPOSE_REP2).
+         * Copying here makes the field immutable at rest (which in turn makes the
+         * accessor's {@code copyOf} a no-op returning the same instance).
+         */
+        public AuditList {
+            actions = List.copyOf(actions);
+        }
+
+        @Override
+        public List<AuditEntry> actions() {
+            return List.copyOf(actions);
+        }
+    }
+
     // ── request bodies ─────────────────────────────────────────────────
 
     /** Slug constraint — lowercase URL-safe (the ZIM/Kiwix path key). */

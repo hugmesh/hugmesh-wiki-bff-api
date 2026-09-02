@@ -294,8 +294,8 @@ public class WikiController {
      *
      * @param limit optional page size; clamped to {@code [1, 1000]}, defaults to 200 when unset
      * @param auth  the caller's Spring Security principal (injected by the framework)
-     * @return a {@link Mono} emitting a map with key {@code "actions"} containing the
-     *         list of {@link WikiAuditLog} entries, newest first
+     * @return a {@link Mono} emitting a {@link WikiDto.AuditList} — {@code {"actions": [...]}}
+     *         of {@link WikiDto.AuditEntry} rows, newest first
      */
     @Operation(
             operationId = "wikiAuditTrail",
@@ -314,13 +314,20 @@ public class WikiController {
     })
     @PreAuthorize(WIKI_MANAGE)
     @GetMapping("/superadmin/audit")
-    public Mono<Map<String, Object>> auditTrail(
+    public Mono<WikiDto.AuditList> auditTrail(
             @RequestParam(name = "limit", required = false) Integer limit,
             Authentication auth) {
         // A null (unset) limit ⇒ 0, which the repository clamp turns into DEFAULT_LIMIT; a
         // supplied limit is clamped to [1, MAX_LIMIT] there. The newest-first ORDER BY + LIMIT
         // makes the read a bounded scan, never a full-table drain of wiki_audit_log.
         int requested = limit == null ? 0 : limit;
-        return wiki.auditTrail(auth, requested).collectList().map(a -> Map.of("actions", a));
+        // The JSON is byte-identical to the old Map.of("actions", rows) form — same key, same
+        // field names (AuditEntry mirrors WikiAuditLog). What changes is the SCHEMA: a named
+        // AuditList/AuditEntry pair instead of an open object, so the generated typed clients
+        // stop seeing Record<string, unknown>.
+        return wiki.auditTrail(auth, requested)
+                .map(WikiDto.AuditEntry::of)
+                .collectList()
+                .map(WikiDto.AuditList::new);
     }
 }

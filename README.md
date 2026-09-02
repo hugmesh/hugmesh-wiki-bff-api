@@ -29,7 +29,7 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
   and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
   `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The full
-  suite is green: **239/239 tests**, run against a real Postgres via Testcontainers rather
+  suite is green: **249/249 tests**, run against a real Postgres via Testcontainers rather
   than an in-memory substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
   server**. The browser only ever holds an **opaque `bff_`-prefixed session** (issued and
@@ -241,7 +241,14 @@ flowchart TD
 | DELETE | `/bff/wiki/admin/access/{accessType}/{userSubject}` | WIKI_WRITE (restore/revoke) — ADMIN own-brand, SUPERADMIN cross-brand |
 | GET | `/bff/wiki/superadmin/access` | WIKI_MANAGE (list active) |
 | GET | `/bff/wiki/superadmin/access/{userSubject}/history` | WIKI_MANAGE |
-| GET | `/bff/wiki/superadmin/audit?limit=` | WIKI_MANAGE (bounded newest-first read, `limit` clamped to `[1, 1000]`, default 200) |
+| GET | `/bff/wiki/superadmin/audit?limit=` | WIKI_MANAGE (bounded newest-first read, `limit` clamped to `[1, 1000]`, default 200) → `WikiDto.AuditList` |
+
+The audit read returns a **named** `AuditList` / `AuditEntry` schema (`{"actions": [...]}`,
+newest first). It used to return a bare `Map<String, Object>`, which springdoc rendered as an
+open `additionalProperties` object — so every ng-openapi-gen client typed it
+`{[key: string]: {}}` and the paired UI had to fall back to `Record<string, unknown>`. The
+JSON on the wire is unchanged (same `actions` key, same `wiki_audit_log` field names); only
+the schema is now real. See [hugmesh-wiki-ui#2](https://github.com/hugmesh/hugmesh-wiki-ui/issues/2).
 
 ## Multi-brand domain scoping
 

@@ -407,10 +407,7 @@
             "content" : {
               "application/json" : {
                 "schema" : {
-                  "type" : "object",
-                  "additionalProperties" : {
-                    "type" : "object"
-                  }
+                  "$ref" : "#/components/schemas/AuditList"
                 }
               }
             }
@@ -924,6 +921,44 @@
             "maxLength" : 64,
             "minLength" : 0,
             "type" : "string"
+          }
+        }
+      },
+      "AuditEntry" : {
+        "type" : "object",
+        "properties" : {
+          "id" : {
+            "type" : "string"
+          },
+          "domain" : {
+            "type" : "string"
+          },
+          "actorSubject" : {
+            "type" : "string"
+          },
+          "action" : {
+            "type" : "string"
+          },
+          "target" : {
+            "type" : "string"
+          },
+          "detail" : {
+            "type" : "string"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "AuditList" : {
+        "type" : "object",
+        "properties" : {
+          "actions" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/AuditEntry"
+            }
           }
         }
       },
