@@ -61,6 +61,36 @@ abstract class SecuritySliceSupport {
                 .build();
     }
 
+    /**
+     * Like {@link #sliceClient} but with the D8 MFA flag ON — {@code SecurityConfig} is
+     * built with {@code app.mfa.enabled=true} and a 10-minute freshness window, so the
+     * privileged-path {@code stepUp} wrappers on {@code /bff/wiki/superadmin/**} and
+     * {@code /bff/wiki/admin/**} are LIVE. Same PROD chain as {@link #sliceClient}
+     * (the {@code commonRoutes} the step-up wrappers live in is shared by both profiles).
+     *
+     * <p>The caller must ALSO enable MFA on whatever produces the authorities (the
+     * {@code TenancyResourceServerConfig} the multi-issuer slice drives), or no token
+     * can ever carry the {@code MFA_SATISFIED} marker the gate demands — the flag is one
+     * platform-wide switch and the slice has to mirror that.
+     *
+     * @param registry        the issuer-&gt;domain registry (single- or multi-issuer)
+     * @param tenantResolver  the per-issuer resolver provider, built with MFA ON
+     * @param controllers     the @RestController instances under test
+     */
+    static WebTestClient mfaSliceClient(
+            DomainRegistry registry,
+            ObjectProvider<ReactiveAuthenticationManagerResolver<ServerWebExchange>> tenantResolver,
+            Object... controllers) {
+
+        SecurityConfig config = new SecurityConfig(registry, tenantResolver, true, 600_000L);
+        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http());
+        WebFilterChainProxy securityFilter = new WebFilterChainProxy(chain);
+
+        return WebTestClient.bindToController(controllers)
+                .webFilter(securityFilter)
+                .build();
+    }
+
     /** An {@link ObjectProvider} that yields the given value from
      *  {@code getIfAvailable()} (what {@code SecurityConfig} calls). */
     @SuppressWarnings("unchecked")

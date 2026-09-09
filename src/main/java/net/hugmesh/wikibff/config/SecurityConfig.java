@@ -13,6 +13,8 @@ import org.springframework.security.access.expression.method.MethodSecurityExpre
 import org.springframework.security.access.hierarchicalroles.RoleHierarchy;
 import org.springframework.security.access.hierarchicalroles.RoleHierarchyImpl;
 import org.springframework.security.authentication.ReactiveAuthenticationManagerResolver;
+import org.springframework.security.authorization.AuthorityReactiveAuthorizationManager;
+import org.springframework.security.authorization.ReactiveAuthorizationManager;
 import org.springframework.security.config.annotation.method.configuration.EnableReactiveMethodSecurity;
 import org.springframework.security.config.core.GrantedAuthorityDefaults;
 import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
@@ -21,11 +23,14 @@ import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.server.resource.authentication.ReactiveJwtAuthenticationConverter;
 import org.springframework.security.web.server.SecurityWebFilterChain;
+import org.springframework.security.web.server.authorization.AuthorizationContext;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import net.hugmesh.commons.config.TenancyResourceServerConfig;
 import net.hugmesh.commons.security.CasdoorAuthorities;
 import net.hugmesh.commons.security.DomainRegistry;
+import net.hugmesh.commons.security.Roles;
 import net.hugmesh.wikibff.security.PrincipalDomain;
 
 /**
@@ -58,6 +63,20 @@ import net.hugmesh.wikibff.security.PrincipalDomain;
  *       {@code hasAnyRole} cannot express) live at the METHOD level via
  *       {@code @PreAuthorize}.</li>
  * </ul>
+ *
+ * <p><b>D8 MFA step-up (ships dark).</b> The two PRIVILEGED path groups —
+ * {@code /bff/wiki/superadmin/**} (WIKI_MANAGE: the audit trail + the access-state
+ * views) and {@code /bff/wiki/admin/**} (WIKI_WRITE: page create/update/publish/delete,
+ * attachment upload/delete, access grant/timeout/ban/restore) — are wrapped in
+ * {@link #stepUp}. While {@code app.mfa.enabled} is {@code false} (today's default,
+ * org-wide) that wrapper is a NO-OP and the emitted policy is byte-identical to the
+ * legacy one; the moment the platform flips the flag those two groups ALSO require the
+ * {@link Roles#MFA_SATISFIED} marker the converter derives from a FRESH
+ * {@code mfa_satisfied_at} claim. Wiring it HERE rather than at flip time means
+ * enforcement arrives WITH the flag, not with a follow-up change to this repo
+ * (hugmesh-forum-bff-api {@code SecurityConfig.stepUp} is the landed precedent). The
+ * ordinary {@code /bff/wiki/**} read floor is deliberately NOT step-up gated — reading
+ * the wiki is not a privileged action.
  *
  * <p><b>Domain-scope (multi-brand).</b> The wiki pages + attachments + audit trail are
  * per-domain. A scoped ADMIN of brand X sees ONLY brand X's pages; the service/repo
@@ -98,7 +117,9 @@ public class SecurityConfig {
 
     /** D8 MFA marker derivation — {@code app.mfa.enabled} (default {@code false},
      *  ships dark). When false the converter emits the byte-identical legacy authority
-     *  set and {@code MFA_SATISFIED} is never produced. */
+     *  set, {@code MFA_SATISFIED} is never produced, and {@link #stepUp} is a no-op.
+     *  Read by BOTH the converter ({@link #casdoorAuthoritiesConverter}) and the path
+     *  gate ({@link #stepUp}) so the same one flag derives AND enforces the marker. */
     private final boolean mfaEnabled;
 
     /** D8 MFA freshness window in millis — {@code app.mfa.freshness-window} (default
@@ -188,23 +209,71 @@ public class SecurityConfig {
      *           mutated in-place by adding path-matcher rules for health probes,
      *           the superadmin surface, the admin surface, and the wiki read floor
      */
-    private static void commonRoutes(ServerHttpSecurity.AuthorizeExchangeSpec ex) {
+    private void commonRoutes(ServerHttpSecurity.AuthorizeExchangeSpec ex) {
         // Probes are public so k8s/Docker healthchecks need no token.
         ex.pathMatchers("/actuator/health", "/actuator/health/**", "/actuator/info").permitAll();
-        // The MANAGE-ALL surface — SUPERADMIN only (settings + the ZIM-rebuild trigger,
-        // PR4). Declared BEFORE the admin + floor prefixes so the most-specific path
-        // matches first.
-        ex.pathMatchers("/bff/wiki/superadmin/**").hasRole("SUPERADMIN");
+        // The MANAGE-ALL surface — SUPERADMIN only (the audit trail + the access-state
+        // views today; settings + the ZIM-rebuild trigger, PR4). Declared BEFORE the
+        // admin + floor prefixes so the most-specific path matches first. Wrapped in the
+        // D8 step-up composition: BYTE-IDENTICAL to .hasRole("SUPERADMIN") while
+        // app.mfa.enabled is off (that is exactly what .hasRole delegates to), plus the
+        // MFA_SATISFIED marker once the platform turns MFA on.
+        ex.pathMatchers("/bff/wiki/superadmin/**").access(
+                stepUp(AuthorityReactiveAuthorizationManager.hasRole("SUPERADMIN")));
         // The write/publish console seam — ADMIN (or the cross-domain SUPERADMIN
         // super-role) end-to-end. Admins reach it via the converter's ROLE_ADMIN with
-        // no ROLE_WIKI needed; SUPERADMIN reaches it via the role hierarchy edge.
-        ex.pathMatchers("/bff/wiki/admin/**").hasAnyRole("ADMIN", "SUPERADMIN");
+        // no ROLE_WIKI needed; SUPERADMIN reaches it via the role hierarchy edge. The
+        // SECOND D8 step-up surface: BYTE-IDENTICAL to .hasAnyRole("ADMIN","SUPERADMIN")
+        // while app.mfa.enabled is off (what .hasAnyRole delegates to), plus the
+        // MFA_SATISFIED marker once the platform turns MFA on.
+        ex.pathMatchers("/bff/wiki/admin/**").access(
+                stepUp(AuthorityReactiveAuthorizationManager.hasAnyRole("ADMIN", "SUPERADMIN")));
         // The whole wiki read surface — the ROLE_WIKI floor is enforced at the gateway,
         // so .authenticated() proves authentication here. The exact WIKI_READ composite
         // (admin|superadmin|(MOD AND WIKI)) is re-checked at the method level
         // (@PreAuthorize) in the controller — NOT here, because hasAnyRole cannot
         // express the MOD-AND-WIKI AND.
         ex.pathMatchers("/bff/wiki/**").authenticated();
+    }
+
+    /**
+     * D8 STEP-UP composition for the two PRIVILEGED wiki path groups. When
+     * {@code app.mfa.enabled} is OFF (the dark default) the {@code base} rule is handed
+     * straight back, so the emitted policy is byte-identical to the legacy one — this
+     * MUST stay a no-op while MFA is dark, because the converter NEVER produces the
+     * marker when the flag is off and an unconditional check would 403 every admin
+     * and superadmin today. When ON, the path additionally demands the non-role
+     * {@link Roles#MFA_SATISFIED} marker.
+     *
+     * <p>The marker is derived ONLY by {@link CasdoorAuthorities} from the BFF-written,
+     * freshness-validated {@code mfa_satisfied_at} claim, and {@code MFA_SATISFIED} is
+     * one of the converter's RESERVED prefixes — so a forged
+     * {@code permissions:["MFA_SATISFIED"]} is dropped before it ever reaches this gate.
+     * This is a genuine second-factor check, not a role re-check.
+     *
+     * <p>Fail-CLOSED by construction: an absent marker is simply "not granted", so a
+     * client-credentials / never-stepped-up / STALE-stamp principal is denied the moment
+     * the platform flips the flag — no follow-up change needed in this repo. {@code base}
+     * is evaluated FIRST and short-circuits on deny, so the step-up leg can only ever
+     * NARROW an already-granted decision, never widen one (an anonymous caller is still
+     * 401 at the base rule, never a step-up 403). COPIED from the landed
+     * hugmesh-forum-bff-api precedent so the two BFFs enforce the flag identically.
+     *
+     * @param base the role/authentication rule this path already enforced
+     * @return {@code base} unchanged while MFA is dark; otherwise {@code base} AND the
+     *         {@link Roles#MFA_SATISFIED} marker
+     */
+    private ReactiveAuthorizationManager<AuthorizationContext> stepUp(
+            ReactiveAuthorizationManager<AuthorizationContext> base) {
+        if (!mfaEnabled) {
+            return base;
+        }
+        ReactiveAuthorizationManager<AuthorizationContext> mfaMarker =
+                AuthorityReactiveAuthorizationManager.hasAuthority(Roles.MFA_SATISFIED);
+        return (authentication, context) -> base.authorize(authentication, context)
+                .flatMap(result -> result.isGranted()
+                        ? mfaMarker.authorize(authentication, context)
+                        : Mono.just(result));
     }
 
     /**
