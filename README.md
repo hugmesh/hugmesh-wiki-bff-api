@@ -281,6 +281,52 @@ its own tokens, and any token with an unknown `iss` claim is rejected with **401
 > ```
 > Leave the variable unset for a single-brand deployment.
 
+### Cut-over: existing rows must be re-stamped BEFORE `APP_TENANCY_ISSUERS` is set
+
+Turning multi-brand on is **not** a config-only change on a cluster that already holds
+wiki data. With `APP_TENANCY_ISSUERS` unset, `DomainRegistry` seeds the back-compat
+single-issuer entry `{CASDOOR_ISSUER_URI -> "default"}`, so `domainOf()` is `"default"` for
+every principal — which is exactly what every existing row is stamped with. Set the
+variable and `domainOf()` starts returning `"<brand>"`, so every `WHERE domain = ?` read
+stops matching those rows.
+
+There is **no error and no 401** when this happens. A single `issuerUri=brand` pair leaves
+`DomainRegistry.isMultiIssuer()` false, so the fail-closed multi-issuer decoder never
+activates. The pages, their attachments, the audit trail and — most sharply — the
+`wiki_access` **grants and bans** simply stop being visible. A banned principal whose ban
+row is stranded at `default` is silently un-banned. Later writes stamp *new* rows
+`"<brand>"`, so an un-migrated rollback leaves split-brain data.
+
+Liquibase changeset **`007-restamp-default-domain.xml`** is the migration for this. It is
+inert until armed, and it re-stamps `domain='default'` to the brand you are about to
+configure across all four domain-bearing tables (`wiki_page`, `wiki_attachment`,
+`wiki_audit_log`, `wiki_access`) in one transaction.
+
+```sh
+# 1. arm and run the migration FIRST (brand must equal the brand half of the pair below,
+#    and must match ^[a-z0-9-]{1,64}$ — DomainRegistry lower-cases and rewrites the rest)
+spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
+
+# 2. only then set the registry
+APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
+```
+
+Between the two steps the brand's rows are unreachable, so do both in one maintenance
+window. To undo, roll back to the tag the changeset lays down **before** setting
+`APP_TENANCY_ISSUERS` — and pass the same parameter, because the rollback statements are
+re-parsed from the changelog:
+
+```sh
+liquibase rollback-to-tag pre-default-domain-restamp -Dwiki.restamp.target.domain=brand-a
+```
+
+Arm this only on a cluster that is **single-issuer today**. On an already-multi-brand
+cluster a `default` row can also come from a SUPERADMIN write (their scope is `null` and
+`WikiPageRepository` coerces it to `DEFAULT_DOMAIN`), and for that population the intended
+brand is not recorded anywhere — running the migration there would sweep those rows into
+whichever brand was named. `DefaultDomainRestampChangesetTest` drives this changelog over a
+real Postgres and asserts the un-armed, armed and rollback behaviours.
+
 > Note on the platform auth model: the JWT this service validates is the **internal custody
 > JWT**. The browser holds an **opaque `bff_`** session, which the fe-gateway swaps for the
 > custody JWT in a pre-security filter before forwarding — so the resource-server
