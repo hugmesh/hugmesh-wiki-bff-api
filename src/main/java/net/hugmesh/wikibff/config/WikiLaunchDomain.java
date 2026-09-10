@@ -130,9 +130,27 @@ public final class WikiLaunchDomain {
     public static Resolution resolve(final String issuerUri, final String issuersCsv) {
         // Construct the REAL registry so the derived string is byte-identical to what
         // PrincipalDomain.forScope will produce for this configuration.
-        Set<String> brands = new DomainRegistry(
+        return resolve(new DomainRegistry(
                 issuerUri == null ? "" : issuerUri,
-                issuersCsv == null ? "" : issuersCsv).knownDomains();
+                issuersCsv == null ? "" : issuersCsv));
+    }
+
+    /**
+     * The same derivation, taken from an ALREADY-CONSTRUCTED registry.
+     *
+     * <p>{@link #resolve(String, String)} exists because an {@code EnvironmentPostProcessor}
+     * runs long before any bean does, so it has only the raw property strings. Once the
+     * context is up the registry is a bean, and re-parsing the properties a second time
+     * would be a second chance to drift from it — so anything holding the bean (the
+     * {@code /bff/wiki/superadmin/brands} catalogue) calls THIS overload and both answers
+     * come from one registry instance.
+     *
+     * @param registry the registry to read {@link DomainRegistry#knownDomains()} from;
+     *                 must not be {@code null}
+     * @return the resolution; never {@code null}
+     */
+    public static Resolution resolve(final DomainRegistry registry) {
+        Set<String> brands = registry.knownDomains();
 
         if (brands.isEmpty()) {
             return fallback("neither app.tenancy.issuers nor an issuer-uri is configured, so"

@@ -192,6 +192,34 @@ per-principal read overrides:
   the read guard queried the victim's own brand, so the ban silently never took effect.
 - **list-active / history** are `WIKI_MANAGE` operations (SUPERADMIN only), served under
   `/bff/wiki/superadmin/access`.
+- **The target-brand catalogue** (`GET /bff/wiki/superadmin/brands`, `WIKI_MANAGE`) serves
+  what the console needs to offer a real PICKER for that `targetDomain` instead of free
+  text (hugmesh-wiki-ui#3). It answers three separate questions and they are not
+  interchangeable:
+  - `brands` — every value this bff will **accept** as a `targetDomain`. Built by running
+    `DomainRegistry.knownDomains()` through `DomainRegistry.isKnownDomain`, the same
+    predicate `WikiAccessService.writeDomain` validates with, so a listed brand is
+    accepted by construction and the always-rejected sentinels (`default`, blank) cannot
+    appear. Sorted, so the rendered order does not drift with an env-var edit.
+  - `launchDomain` — the domain this wiki is **launched on**, from the same
+    `WikiLaunchDomain` derivation the 007 re-stamp target uses (so the console and the
+    migration can never disagree), falling back to `hugmesh`. It is **not necessarily a
+    member of `brands`**: with 2+ brands there is no single launch domain and the fallback
+    is reported, so a caller must check membership before preselecting it.
+  - `targetDomainHonoured` — whether `targetDomain` is consulted **at all**.
+    `writeDomain` reads it only when `DomainRegistry.isMultiIssuer()`, i.e. **two or more**
+    configured issuer pairs. Below that a SUPERADMIN write is stamped `default` whatever
+    the body said.
+  With **exactly one** configured pair (`app.tenancy.issuers=https://id=hugmesh`) those
+  last two combine into a live hazard: users resolve `hugmesh`, but a SUPERADMIN grant or
+  ban is stamped `default`, so `WikiAccessGuard` — which reads back
+  `activeFor(subject, "hugmesh")` — never matches it. That is the same
+  silently-ineffective ban #39 closed for 2+ brands, still open at exactly 1, and issue
+  #19's launch-domain derivation makes the single-pair mapping the first-class
+  single-brand launch shape. This endpoint does not change `writeDomain` (that would turn
+  a silent no-op into a 400 for existing deployments); it makes the combination
+  *detectable* — `brands` non-empty while `targetDomainHonoured` is false — so the console
+  can warn instead of rendering a control the server discards.
 - Rows transition from `active` to `revoked` but are **never hard-deleted** — the full
   history is retained for audit. A re-grant after revocation inserts a new row.
 - Precedence in `WikiAccessGuard`: an active ban or timeout **denies even a role-holder or
@@ -242,6 +270,7 @@ flowchart TD
 | GET | `/bff/wiki/superadmin/access` | WIKI_MANAGE (list active) |
 | GET | `/bff/wiki/superadmin/access/{userSubject}/history` | WIKI_MANAGE |
 | GET | `/bff/wiki/superadmin/audit?limit=` | WIKI_MANAGE (bounded newest-first read, `limit` clamped to `[1, 1000]`, default 200) → `WikiDto.AuditList` |
+| GET | `/bff/wiki/superadmin/brands` | WIKI_MANAGE (the target-brand catalogue) → `WikiAccessDto.Brands` |
 
 The audit read returns a **named** `AuditList` / `AuditEntry` schema (`{"actions": [...]}`,
 newest first). It used to return a bare `Map<String, Object>`, which springdoc rendered as an

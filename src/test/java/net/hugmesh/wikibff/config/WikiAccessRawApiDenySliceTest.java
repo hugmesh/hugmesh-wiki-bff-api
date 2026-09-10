@@ -86,7 +86,7 @@ class WikiAccessRawApiDenySliceTest extends SecuritySliceSupport {
         // registry — so a denied request can be proven to NEVER reach the repo.
         repo = mock(WikiAccessRepository.class);
         WikiAccessService service = new WikiAccessService(repo, new PrincipalDomain(registry));
-        WikiAccessController controller = new WikiAccessController(service);
+        WikiAccessController controller = new WikiAccessController(service, registry);
 
         client = sliceClient(registry, provider(resolver), controller);
     }
@@ -181,6 +181,51 @@ class WikiAccessRawApiDenySliceTest extends SecuritySliceSupport {
         verify(repo, never()).listActive(any());
     }
 
+    // ── /superadmin/brands: SUPERADMIN-only, and its payload is the write path's own
+    //    acceptance rule (hugmesh-wiki-bff-api#12 / hugmesh-wiki-ui#3) ──────────
+
+    /**
+     * The catalogue the console builds its target-brand PICKER from must contain exactly the
+     * values this bff would accept in {@code targetDomain} — on this slice's registry, the two
+     * configured brands and nothing else. It must NOT contain {@code default}: {@code
+     * isKnownDomain} rejects that sentinel before consulting the map, so offering it would be a
+     * guaranteed 400.
+     */
+    @Test
+    void superadmin_readsBrandCatalogue_listingExactlyTheAcceptedTargetDomains() {
+        client.get().uri("/bff/wiki/superadmin/brands")
+                .header("Authorization", bearerX("root", "superadmin"))
+                .exchange().expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.brands.length()").isEqualTo(2)
+                .jsonPath("$.brands[0]").isEqualTo("brandx")
+                .jsonPath("$.brands[1]").isEqualTo("brandy")
+                // Two issuer pairs are configured, so writeDomain DOES consult targetDomain.
+                .jsonPath("$.targetDomainHonoured").isEqualTo(true)
+                // ...and with two brands there is no single domain this wiki is launched on, so
+                // the derivation reports its fallback. It is deliberately NOT a member of
+                // `brands` here — a console that preselected it blindly would preselect a value
+                // the server rejects, which is why the field is documented as check-membership-first.
+                .jsonPath("$.launchDomain").isEqualTo("hugmesh");
+        verifyNoInteractions(repo);
+    }
+
+    @Test
+    void admin_cannotReadBrands_superadminOnly_403() {
+        client.get().uri("/bff/wiki/superadmin/brands")
+                .header("Authorization", bearerX("admin-x", "admin"))
+                .exchange().expectStatus().isForbidden();
+        verifyNoInteractions(repo);
+    }
+
+    @Test
+    void mod_cannotReadBrands_superadminOnly_403() {
+        client.get().uri("/bff/wiki/superadmin/brands")
+                .header("Authorization", bearerX("mod-x", "mod"))
+                .exchange().expectStatus().isForbidden();
+        verifyNoInteractions(repo);
+    }
+
     // ── anonymous → 401 on every gated method, repo untouched ──────────────────
 
     @Test
@@ -195,6 +240,13 @@ class WikiAccessRawApiDenySliceTest extends SecuritySliceSupport {
     @Test
     void anonymous_listActive_401() {
         client.get().uri("/bff/wiki/superadmin/access")
+                .exchange().expectStatus().isUnauthorized();
+        verifyNoInteractions(repo);
+    }
+
+    @Test
+    void anonymous_brands_401() {
+        client.get().uri("/bff/wiki/superadmin/brands")
                 .exchange().expectStatus().isUnauthorized();
         verifyNoInteractions(repo);
     }
