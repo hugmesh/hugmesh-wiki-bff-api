@@ -311,6 +311,13 @@ spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
 APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
 ```
 
+The Spring property form above is the one covered by a test
+(`RestampParameterBindingBootTest` boots the app with it set and asserts the changeset is
+recorded as executed rather than skipped). If you arm it from a Kubernetes env var instead
+(`SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN`), confirm in the boot log that the
+`... NOT armed` precondition message is **absent** before trusting the run — an un-armed run
+is silent by design.
+
 Between the two steps the brand's rows are unreachable, so do both in one maintenance
 window. To undo, roll back to the tag the changeset lays down **before** setting
 `APP_TENANCY_ISSUERS` — and pass the same parameter, because the rollback statements are
