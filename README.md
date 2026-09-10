@@ -216,8 +216,9 @@ per-principal read overrides:
   `activeFor(subject, "hugmesh")` — never matches it. That is the same
   silently-ineffective ban #39 closed for 2+ brands, still open at exactly 1, and issue
   #19's launch-domain derivation makes the single-pair mapping the first-class
-  single-brand launch shape. This endpoint does not change `writeDomain` (that would turn
-  a silent no-op into a 400 for existing deployments); it makes the combination
+  single-brand launch shape. It is filed for a decision as **issue #21**. This endpoint
+  does not change `writeDomain` (that would turn a silent no-op into a 400 for existing
+  deployments); it makes the combination
   *detectable* — `brands` non-empty while `targetDomainHonoured` is false — so the console
   can warn instead of rendering a control the server discards.
 - Rows transition from `active` to `revoked` but are **never hard-deleted** — the full

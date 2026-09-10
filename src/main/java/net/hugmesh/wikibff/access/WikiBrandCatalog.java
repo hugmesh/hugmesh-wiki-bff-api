@@ -51,7 +51,7 @@ import net.hugmesh.wikibff.config.WikiLaunchDomain;
  *
  * <p>Changing {@code writeDomain} to fail closed there would turn today's silent no-op into a
  * {@code 400} for existing deployments — a behaviour change nobody asked for — so this class
- * does NOT change it. It REPORTS it: {@code targetDomainHonoured} is false there while
+ * does NOT change it; it is filed for a decision as issue #21. It REPORTS it: {@code targetDomainHonoured} is false there while
  * {@code brands} is non-empty, which is a combination the console can detect and warn on
  * instead of rendering a control that does nothing.
  *
