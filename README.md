@@ -319,20 +319,69 @@ recorded as executed rather than skipped). If you arm it from a Kubernetes env v
 is silent by design.
 
 Between the two steps the brand's rows are unreachable, so do both in one maintenance
-window. To undo, roll back to the tag the changeset lays down **before** setting
-`APP_TENANCY_ISSUERS` — and pass the same parameter, because the rollback statements are
-re-parsed from the changelog:
+window.
+
+**Before you arm it, check the cluster really is single-brand.** If a row already stamped
+`<brand>` shares a unique key with a `default` row being moved onto it, the forward UPDATE
+violates `uq_wiki_page_domain_slug` or `uq_wiki_access_active` and the run throws. The
+transaction rolls back cleanly — every row keeps its old stamp and the changeset stays
+`PENDING`, so nothing is half-migrated — but because Liquibase runs at startup you will see
+this as **the application failing to boot**, not as a migration warning. One `default` row
+per group is the safe state:
 
 ```sh
+psql -c "SELECT domain, count(*) FROM wiki_page   GROUP BY domain;"
+psql -c "SELECT domain, count(*) FROM wiki_access GROUP BY domain;"
+```
+
+#### Undoing it
+
+Pass the same `wiki.restamp.target.domain` parameter to any rollback — the rollback
+statements are re-parsed from the changelog, so without it they predicate on the literal,
+un-substituted placeholder and match nothing. Roll back **before** setting
+`APP_TENANCY_ISSUERS`; afterwards the inverse re-stamp drags post-cut-over writes back to
+`default` too.
+
+```sh
+# preferred: immediately after the armed run the re-stamp is the last changeset executed,
+# so this undoes exactly it and can touch nothing else
+liquibase rollback-count 1 -Dwiki.restamp.target.domain=brand-a
+```
+
+```sh
+# also works, but reverses EVERYTHING recorded after the tag, in reverse order
 liquibase rollback-to-tag pre-default-domain-restamp -Dwiki.restamp.target.domain=brand-a
 ```
 
+The tag is laid down **during the armed cut-over run**, immediately before the re-stamp —
+not at the first deployment of the changelog — precisely so that changesets which landed in
+the months before the cut-over sit *before* it and `rollback-to-tag` cannot reach them. An
+un-armed deployment therefore lays down **no tag at all**, which is correct: there is
+nothing to roll back to yet. If anything has been deployed *since* the cut-over, prefer
+`rollback-count`.
+
+#### What the migration costs you: SUPERADMIN writes to migrated rows
+
+After the re-stamp a **SUPERADMIN can no longer write the rows it moved**. `forScope`
+returns `null` for a SUPERADMIN (the cross-domain *read* bypass) and every write path
+coerces that `null` to `DEFAULT_DOMAIN` (`WikiPageRepository` create/update/publish/delete,
+`WikiAttachmentRepository`, `WikiAuditLogRepository`, `WikiAccessRepository`), so a
+SUPERADMIN write is literally `... WHERE domain = 'default'` and there are no `default` rows
+left. On a migrated page a SUPERADMIN's update answers a nonsense **409**, their publish a
+**404**, and their delete answers **204 having deleted nothing**.
+
+The brand's own scoped ADMIN/EDITOR principals *do* regain full write access to every
+migrated row — that is what makes the brand the right target. The SUPERADMIN gap is issue
+**#15** (SUPERADMIN writes must use the `null` cross-domain scope rather than coercing to
+`DEFAULT_DOMAIN`), and **#15 must land before a SUPERADMIN can administer a post-cut-over
+deployment**.
+
 Arm this only on a cluster that is **single-issuer today**. On an already-multi-brand
-cluster a `default` row can also come from a SUPERADMIN write (their scope is `null` and
-`WikiPageRepository` coerces it to `DEFAULT_DOMAIN`), and for that population the intended
-brand is not recorded anywhere — running the migration there would sweep those rows into
-whichever brand was named. `DefaultDomainRestampChangesetTest` drives this changelog over a
-real Postgres and asserts the un-armed, armed and rollback behaviours.
+cluster a `default` row can also come from a SUPERADMIN write (same coercion as above), and
+for that population the intended brand is not recorded anywhere — running the migration
+there would sweep those rows into whichever brand was named.
+`DefaultDomainRestampChangesetTest` drives this changelog over a real Postgres and asserts
+the un-armed, armed, rollback, tag-timing, forward-collision and SUPERADMIN-cost behaviours.
 
 > Note on the platform auth model: the JWT this service validates is the **internal custody
 > JWT**. The browser holds an **opaque `bff_`** session, which the fe-gateway swaps for the
