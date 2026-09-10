@@ -45,11 +45,15 @@
     <!--
       007 — MULTI-BRAND CUT-OVER RE-STAMP (issue #19). A one-shot DATA migration (no DDL)
       that moves every domain='default' row in wiki_page / wiki_attachment /
-      wiki_audit_log / wiki_access to the brand the operator is about to configure in
-      APP_TENANCY_ISSUERS. INERT until armed with the Liquibase parameter
-      `wiki.restamp.target.domain`; un-armed it stays PENDING (onFail=CONTINUE) so a
-      cut-over months after the first boot can still run it. Also lays down the
-      `pre-default-domain-restamp` tag so the migration has a named rollback point.
+      wiki_audit_log / wiki_access to the brand configured in APP_TENANCY_ISSUERS.
+      The target is DERIVED AT BOOT from that mapping by
+      RestampTargetEnvironmentPostProcessor (issue #19) — the operator does not type a
+      brand — and is published as the Liquibase parameter `wiki.restamp.target.domain`,
+      which can still be set by hand to override it. It arms ONLY when the mapping names
+      exactly one brand, so the whole cut-over is now a single redeploy; un-armed it stays
+      PENDING (onFail=CONTINUE) so a cut-over months after the first boot can still run it.
+      Also lays down the `pre-default-domain-restamp` tag so the migration has a named
+      rollback point.
       Full rationale, the exhaustive list of what it touches, and the proof of the
       selection are in the file's own header comment.
     -->

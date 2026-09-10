@@ -281,7 +281,7 @@ its own tokens, and any token with an unknown `iss` claim is rejected with **401
 > ```
 > Leave the variable unset for a single-brand deployment.
 
-### Cut-over: existing rows must be re-stamped BEFORE `APP_TENANCY_ISSUERS` is set
+### Cut-over: set `APP_TENANCY_ISSUERS` and redeploy — the re-stamp derives its own target
 
 Turning multi-brand on is **not** a config-only change on a cluster that already holds
 wiki data. With `APP_TENANCY_ISSUERS` unset, `DomainRegistry` seeds the back-compat
@@ -297,29 +297,70 @@ activates. The pages, their attachments, the audit trail and — most sharply �
 row is stranded at `default` is silently un-banned. Later writes stamp *new* rows
 `"<brand>"`, so an un-migrated rollback leaves split-brain data.
 
-Liquibase changeset **`007-restamp-default-domain.xml`** is the migration for this. It is
-inert until armed, and it re-stamps `domain='default'` to the brand you are about to
-configure across all four domain-bearing tables (`wiki_page`, `wiki_attachment`,
-`wiki_audit_log`, `wiki_access`) in one transaction.
+Liquibase changeset **`007-restamp-default-domain.xml`** is the migration for this. It
+re-stamps `domain='default'` to the brand you are configuring, across all four
+domain-bearing tables (`wiki_page`, `wiki_attachment`, `wiki_audit_log`, `wiki_access`) in
+one transaction — and since issue #19 it **works out the brand for itself**. You do not
+type it.
 
 ```sh
-# 1. arm and run the migration FIRST (brand must equal the brand half of the pair below,
-#    and must match ^[a-z0-9-]{1,64}$ — DomainRegistry lower-cases and rewrites the rest)
-spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
-
-# 2. only then set the registry
+# The whole cut-over. One step.
 APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
 ```
 
-The Spring property form above is the one covered by a test
-(`RestampParameterBindingBootTest` boots the app with it set and asserts the changeset is
-recorded as executed rather than skipped). If you arm it from a Kubernetes env var instead
-(`SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN`), confirm in the boot log that the
-`... NOT armed` precondition message is **absent** before trusting the run — an un-armed run
-is silent by design.
+`RestampTargetEnvironmentPostProcessor` reads that mapping through a real `DomainRegistry`
+before Liquibase binds its parameters, and publishes the brand as
+`wiki.restamp.target.domain`. Because Liquibase runs during context refresh, the re-stamp
+completes **before the application serves its first request** under the new brand, in the
+same boot that configures it. There is no window between the two and nothing to sequence.
 
-Between the two steps the brand's rows are unreachable, so do both in one maintenance
-window.
+> **This replaces the old two-step procedure.** Earlier revisions of this README told you
+> to run the migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an
+> un-armed run publishes no target and migrates nothing.
+
+It arms **only** when the mapping names exactly one brand:
+
+| `APP_TENANCY_ISSUERS`        | every principal resolves | re-stamp target | arms? |
+| ---------------------------- | ------------------------ | --------------- | ----- |
+| unset / no valid pair        | `default`                | none            | no    |
+| one pair `https://i=brand-a` | `brand-a`                | `brand-a`       | **yes** |
+| two or more pairs            | per-issuer brand         | none            | no    |
+
+**Unset does not arm, and that is deliberate.** With nothing configured every principal
+already resolves `default` — the stamp the rows already carry — so there is nothing to
+re-stamp. The launch domain is reported as `hugmesh` (`WikiLaunchDomain.FALLBACK_DOMAIN`,
+per the operator: *"hugmesh is teh default"*), but it is **not** written to the rows:
+doing that while the runtime still resolves `default` would strand the entire wiki behind
+a predicate nobody matches. `hugmesh` becomes the live launch domain the moment you name
+it — `APP_TENANCY_ISSUERS=https://casdoor.hugmesh.example.com=hugmesh` — and then it arms
+like any other brand. It is deliberately *not* made live by changing
+`DomainRegistry.DEFAULT_DOMAIN`, which admin-bff, federation-api, user-bff, owncast-bff
+and forum-bff all share and none of which has a re-stamp migration of its own.
+
+**Two or more does not arm** because there is no single launch domain, and because on an
+already-multi-brand cluster `default` rows can also be written by a SUPERADMIN (see the
+SUPERADMIN note below), so an auto-armed run would sweep those into whichever brand
+sorted first.
+
+**Manual override still works** and is the escape hatch for both refused shapes — set
+`spring.liquibase.parameters.wiki.restamp.target.domain` (or the
+`SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` env var) and it wins over the
+derivation. The value must still match `^[a-z0-9-]{1,64}$` and must not be `default`.
+
+Whichever path you use, the boot log states the outcome in one line — `launch domain
+derived as '<brand>' ... Arming the cut-over re-stamp`, or `... is NOT armed — <reason>`.
+Read it: an un-armed run is otherwise silent by design.
+
+**Renaming the brand after the cut-over refuses the next startup, on purpose.** Editing
+`APP_TENANCY_ISSUERS` from `=brand-a` to `=brand-b` changes the derived parameter, which
+is substituted into the changeset's SQL before Liquibase checksums it, so the redeploy
+dies with `ValidationFailedException: ... 1 changesets check sum ...
+007-restamp-default-domain-to-brand ... was: 9:<a> but is now: 9:<b>`. Nothing is
+migrated. That is the safe outcome — the rows sit at `brand-a` while every principal now
+resolves `brand-b`, and a silent skip would hide an emptied wiki until users reported it.
+A post-cut-over rename is a real data migration this changeset does not perform; resolve
+it deliberately (re-stamp `brand-a` -> `brand-b`, then `changelogSync`), never by
+relaxing the checksum. Redeploying *unchanged* is a safe no-op.
 
 **Before you arm it, check the cluster really is single-brand.** If a row already stamped
 `<brand>` shares a unique key with a `default` row being moved onto it, the forward UPDATE
@@ -338,9 +379,13 @@ psql -c "SELECT domain, count(*) FROM wiki_access GROUP BY domain;"
 
 Pass the same `wiki.restamp.target.domain` parameter to any rollback — the rollback
 statements are re-parsed from the changelog, so without it they predicate on the literal,
-un-substituted placeholder and match nothing. Roll back **before** setting
-`APP_TENANCY_ISSUERS`; afterwards the inverse re-stamp drags post-cut-over writes back to
-`default` too.
+un-substituted placeholder and match nothing. **The derivation does not help here:**
+`RestampTargetEnvironmentPostProcessor` is a Spring Boot `EnvironmentPostProcessor`, so it
+runs only when the *application* boots. A rollback driven from the Liquibase CLI or Maven
+plugin must pass the brand explicitly, and it must be the brand the forward run actually
+used — the cut-over boot log records it verbatim; `databasechangelog` does not. Roll back
+**before** the cut-over boot if you can; afterwards the inverse re-stamp drags
+post-cut-over writes back to `default` too.
 
 ```sh
 # preferred: immediately after the armed run the re-stamp is the last changeset executed,

@@ -162,36 +162,107 @@
 
       Exactly one row, reading `default`, is the safe state.
 
-      ── ARMING ──────────────────────────────────────────────────────────────────
-      Supply the Liquibase changelog parameter `wiki.restamp.target.domain`, e.g.
+      ── ARMING: DERIVED AT BOOT, NOT TYPED (issue #19, operator answer) ─────────
+      The operator's answer on hugmesh-generator#347 was "hugmesh is teh default but
+      should always take what domain the wiki is launched on", so the brand is no longer
+      typed. `RestampTargetEnvironmentPostProcessor` (registered in
+      META-INF/spring.factories) runs before Liquibase binds its parameters and publishes
+      `wiki.restamp.target.domain` from `WikiLaunchDomain.resolve(...)`, which reads the
+      brand out of a REAL `DomainRegistry` built from the same two properties the runtime
+      uses. The target is therefore, by construction, the exact string
+      `PrincipalDomain.forScope` will put in `WHERE domain = ?` — not a second parser that
+      could drift from it over trailing slashes, `sanitize()`'s lower-casing, or its
+      `[^a-z0-9-] -> '-'` replacement.
 
-          spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
+      Three configuration shapes, and only one arms:
 
-      matching the brand half of the `APP_TENANCY_ISSUERS` pair you are about to set.
-      The value must satisfy `DomainRegistry.sanitize()`'s output alphabet
-      (`^[a-z0-9-]{1,64}$`) — the registry lower-cases and replaces every other
-      character, so "Brand A" configured there becomes "brand-a", and re-stamping to
-      "Brand A" here would strand the rows in a domain no principal can ever resolve.
-      A value that is absent, blank, "default", or outside that alphabet leaves the
-      changeset UNRUN and PENDING (onFail="CONTINUE", not MARK_RAN — a cut-over happens
-      later than the first boot, so the changeset must survive every un-armed run and
-      still be available when it is finally armed).
+        app.tenancy.issuers        | runtime domainOf() | target published | arms?
+        ───────────────────────────┼────────────────────┼──────────────────┼──────
+        unset / no valid pair      | "default"          | none             | NO
+        ONE pair "https://i=acme"  | "acme"             | "acme"           | YES
+        two or more pairs          | per-issuer brand   | none             | NO
 
-      On the ordering of that check, stated plainly: Liquibase changelog parameters are
-      TEXTUAL substitution and `sqlCheck` has no bind-parameter form, so the operator's
-      raw value is spliced into the very regex check meant to sanitise it. The chain
-      still fails CLOSED, and that is measured, not assumed
-      (`DefaultDomainRestampChangesetTest` → `ArmingParameterFailsClosed`): an
-      injection-shaped value makes the precondition SQL itself unparseable, `onError`
-      ="CONTINUE" swallows it, and because the precondition did not PASS the `<sql>`
-      block — the only place the value reaches an UPDATE — never runs at all. The
-      operator supplying this parameter already owns the database, so this is an
-      ordering wart, not a privilege boundary; it is documented so nobody later mistakes
-      the regex for a sanitiser applied before substitution.
+      UNSET does not arm, and this is the point the fallback turns on. With nothing
+      configured every principal resolves the literal 'default' — which is exactly what
+      every stored row carries, so the stamp and the runtime ALREADY AGREE and there is
+      nothing to re-stamp. `WikiLaunchDomain.FALLBACK_DOMAIN` is "hugmesh" and is reported
+      in the boot log as the domain the wiki considers itself launched on, but it is NOT
+      published as a target: writing it onto those rows while the runtime still resolves
+      'default' would strand the whole wiki — pages, attachments, audit trail, and the
+      wiki_access grants and BANS — behind a predicate nobody matches. "hugmesh" becomes
+      the live launch domain the moment the operator NAMES it
+      (APP_TENANCY_ISSUERS=https://id.hugmesh.net=hugmesh), and then it arms like any
+      other brand with nothing typed. It is deliberately NOT made live by changing
+      `DomainRegistry.DEFAULT_DOMAIN`: that constant is shared by admin-bff,
+      federation-api, user-bff, owncast-bff and forum-bff, each with its own database full
+      of domain='default' rows and NO re-stamp migration of its own, so changing it would
+      strand five other services' data in order to rename this one's. See issue #19.
 
-      ORDER OF OPERATIONS at cut-over: run this migration FIRST, then set
-      `APP_TENANCY_ISSUERS`. Between the two the brand's rows are unreachable, so do it
-      in one maintenance window.
+      TWO OR MORE does not arm because there is no single domain the wiki is launched on,
+      and because on an already-multi-brand cluster 'default' rows can also be minted by a
+      SUPERADMIN write (their scope is null and the repositories coerce it to
+      DEFAULT_DOMAIN), so an auto-armed run would sweep SUPERADMIN-authored rows into
+      whichever brand sorted first.
+
+      MANUAL OVERRIDE, unchanged from PR #20 and still the escape hatch for both refused
+      shapes: set the parameter yourself and it wins. The derived value is contributed with
+      `addLast`, i.e. lowest precedence, so an application.yml entry, a
+      SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN environment variable, a -D
+      system property or a test's inlined properties all beat it with no ordering
+      assumption. The value must still satisfy `^[a-z0-9-]{1,64}$` and must not be
+      'default'; a value that is absent, blank, 'default' or outside that alphabet leaves
+      the changeset UNRUN and PENDING (onFail="CONTINUE", not MARK_RAN — a cut-over happens
+      later than the first boot, so the changeset must survive every un-armed run and still
+      be available when it is finally armed).
+
+      On the ordering of that regex check, stated plainly: Liquibase changelog parameters
+      are TEXTUAL substitution and `sqlCheck` has no bind-parameter form, so the supplied
+      raw value is spliced into the very regex check meant to sanitise it. The chain still
+      fails CLOSED, and that is measured, not assumed (`DefaultDomainRestampChangesetTest`
+      -> `ArmingParameterFailsClosed`): an injection-shaped value makes the precondition SQL
+      itself unparseable, `onError`="CONTINUE" swallows it, and because the precondition did
+      not PASS the `<sql>` block — the only place the value reaches an UPDATE — never runs
+      at all. Anyone supplying this parameter already owns the database, so this is an
+      ordering wart, not a privilege boundary; it is documented so nobody later mistakes the
+      regex for a sanitiser applied before substitution. Note the DERIVED path cannot reach
+      it: a value out of `DomainRegistry.sanitize()` is already in the alphabet, and
+      `WikiLaunchDomain` additionally refuses anything over the 64-character width of the
+      domain column, which `sanitize()` does not cap.
+
+      ── ORDER OF OPERATIONS: ONE STEP NOW, AND THE WINDOW IS GONE ───────────────
+      SUPERSEDED. Before the derivation, this header told the operator to run the migration
+      FIRST and set APP_TENANCY_ISSUERS second, leaving a window in which the brand's rows
+      were unreachable. That is no longer the procedure and following it now would do
+      nothing, because an un-armed run publishes no target.
+
+      The cut-over is now ONE step: set APP_TENANCY_ISSUERS to the single
+      "https://issuer=<brand>" pair and redeploy. Liquibase runs during context refresh, so
+      the re-stamp completes BEFORE the application serves its first request under the new
+      brand, in the same boot that configures it. There is no window and nothing to
+      sequence. Budget for the boot to fail if the forward run collides (see above) — that
+      is the one case where the maintenance window still matters.
+
+      ── THE SECOND BOOT, AND WHAT A BRAND RENAME DOES (MEASURED) ────────────────
+      Because the target now moves with configuration rather than with a human retyping it,
+      two redeploy sequences are reachable that were not before. `DerivedTargetRerunTest`
+      measures both against a real Postgres:
+
+        * REDEPLOY UNCHANGED — safe no-op. The changeset is already recorded, so it does not
+          re-run; it does not throw, and a 'default' row written AFTER the cut-over (e.g. by
+          a SUPERADMIN, see #15) is left exactly where it is. The migration is one-shot, not
+          continuous.
+
+        * RENAME THE BRAND (=acme -> =globex) AND REDEPLOY — REFUSED STARTUP, loudly. The
+          derived parameter is substituted into the `<sql>` before Liquibase checksums it,
+          so the recorded checksum no longer matches and the run dies with
+          `ValidationFailedException: Validation Failed: 1 changesets check sum ...
+          007-restamp-default-domain-to-brand ... was: 9:<a> but is now: 9:<b>`. Nothing is
+          migrated and nothing is half-migrated. This is the GOOD outcome and it is why no
+          `validCheckSum="ANY"` is set here: the rows sit at 'acme' while every principal
+          now resolves 'globex', and a silent skip would hide an emptied wiki until users
+          reported it. A rename after cut-over is a genuine data migration that this
+          changeset does not perform — resolve it deliberately (re-stamp acme -> globex and
+          `changelogSync`), never by relaxing the checksum.
 
       ── ROLLBACK ────────────────────────────────────────────────────────────────
       The inverse re-stamp, `<brand>` -> 'default', over the same four tables. It is
@@ -200,7 +271,13 @@
       post-cut-over writes are dragged back to 'default' too. The SAME
       `wiki.restamp.target.domain` parameter must be supplied to the rollback run — the
       rollback statements are re-parsed from this changelog, so without it they would
-      predicate on the literal, un-substituted placeholder and match nothing.
+      predicate on the literal, un-substituted placeholder and match nothing. NOTE THE
+      DERIVATION DOES NOT HELP HERE: `RestampTargetEnvironmentPostProcessor` is a Spring
+      Boot EnvironmentPostProcessor, so it runs only when the APPLICATION boots. A rollback
+      driven from the Liquibase CLI or Maven plugin must pass the brand explicitly
+      (`-Dwiki.restamp.target.domain=<brand>`), and it must be the brand the forward run
+      actually used — which the boot log of the cut-over records verbatim, and which
+      `databasechangelog` does not.
 
       PREFER `liquibase rollback-count 1`. Immediately after the armed run the re-stamp
       is the last changeset executed, so `rollback-count 1` undoes exactly it and can
