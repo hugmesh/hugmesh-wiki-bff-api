@@ -41,4 +41,17 @@
       app — mints the id; the repositories INSERT without id and read it back via RETURNING id.
     -->
     <include file="db/changelog/006-db-generated-uuid-pks.xml"/>
+
+    <!--
+      007 — MULTI-BRAND CUT-OVER RE-STAMP (issue #19). A one-shot DATA migration (no DDL)
+      that moves every domain='default' row in wiki_page / wiki_attachment /
+      wiki_audit_log / wiki_access to the brand the operator is about to configure in
+      APP_TENANCY_ISSUERS. INERT until armed with the Liquibase parameter
+      `wiki.restamp.target.domain`; un-armed it stays PENDING (onFail=CONTINUE) so a
+      cut-over months after the first boot can still run it. Also lays down the
+      `pre-default-domain-restamp` tag so the migration has a named rollback point.
+      Full rationale, the exhaustive list of what it touches, and the proof of the
+      selection are in the file's own header comment.
+    -->
+    <include file="db/changelog/007-restamp-default-domain.xml"/>
 </databaseChangeLog>

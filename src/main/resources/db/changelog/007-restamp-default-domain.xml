@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+      ══════════════════════════════════════════════════════════════════════════════
+      007 — THE MULTI-BRAND CUT-OVER RE-STAMP (issue #19)
+
+      One-shot data migration that carries the rows of a SINGLE-ISSUER wiki-bff across
+      to the brand name it is about to be given, at the moment the operator turns on
+      `APP_TENANCY_ISSUERS`. It is INERT until armed (see "Arming" below), so a
+      single-tenant cluster is untouched.
+
+      ── WHY IT IS NEEDED (measured, not assumed) ─────────────────────────────────
+      Issue #19's premise — "rows written before brand scoping carry domain='default'"
+      — does NOT hold for this repo, and the correction is in the CODE, not in git
+      archaeology (the history is a squashed 2026-07-29 snapshot and cannot testify
+      about anything before it). The direct evidence:
+
+        * all four domain-bearing tables declare `domain varchar(64)` with
+          `defaultValue="default"` AND `<constraints nullable="false"/>` (001..004), so
+          no row has ever been able to exist without a domain; and
+        * `PrincipalDomain.forScope` derives the domain SERVER-SIDE from the JWT issuer
+          on every write path, so no client has ever been able to choose one.
+
+      There is therefore no "pre-brand-scoping epoch" population to repair. What DOES
+      exist is a cut-over hazard, documented in the platform manifest (hugmesh-generator
+      `specs/cluster/manifests/wiki-bff-api/deployment.yaml`, the "APP_TENANCY_ISSUERS is
+      deliberately NOT set here" comment):
+
+        * UNSET `APP_TENANCY_ISSUERS` ⇒ commons' DomainRegistry seeds the back-compat
+          single-issuer entry {CASDOOR_ISSUER_URI -> "default"}, so `domainOf()` is
+          "default" for every principal — which is exactly what every existing row is
+          stamped with. Everything matches.
+        * SET it to "https://id.<domain>=<brand>" ⇒ `domainOf()` starts returning
+          "<brand>", so every `WHERE domain = ?` read stops matching the existing
+          "default" rows. A SINGLE pair also leaves `isMultiIssuer()` false, so the
+          fail-closed multi-issuer decoder never activates: no 401, no error — the
+          pages, the attachments, the audit trail and (worst) the `wiki_access`
+          GRANTS AND BANS simply vanish. Later writes stamp NEW rows "<brand>", so an
+          un-migrated rollback leaves split-brain data.
+
+      A silently-dropped BAN is the sharp edge here: `WikiAccessGuard` reads
+      `wiki_access` scoped by domain, so a banned principal whose ban row is stranded
+      at "default" is silently un-banned the moment the brand is configured.
+
+      ── WHICH BRAND, AND WHY THAT ONE ────────────────────────────────────────────
+      Issue #19 asked for "their real brand, or a documented sentinel if the real brand
+      is unrecoverable". The real brand IS recoverable — but not from this database.
+      Nothing in the wiki schema records an intended brand for a "default" row: the
+      page, its attachments, its audit rows and its ACL rows are ALL stamped with the
+      same coerced "default", and there is no subject→brand mapping anywhere in it. The
+      brand is recoverable because before the cut-over the deployment has exactly ONE
+      brand, and the operator is in the act of naming it. So the target brand is an
+      OPERATOR-SUPPLIED changelog parameter, not a guess — and this migration is run
+      as part of the cut-over, not speculatively.
+
+      NOT a sentinel, deliberately — but the discriminator is NARROWER than it looks,
+      so state it exactly. Re-stamping to a synthetic sentinel (`__unbranded__` and
+      friends) changes no read reachability (no principal resolves either "default" or a
+      sentinel once a brand is configured). The real difference is that a BRAND is
+      resolvable by that brand's own scoped principals, who therefore get their pages,
+      attachments, audit trail and ACL overlay back; a sentinel is resolvable by nobody
+      and the rows are lost to everyone. On the SUPERADMIN axis the two options cost
+      exactly the same — see the next section, which is the honest version of a claim an
+      earlier draft of this header got wrong by presenting the SUPERADMIN breakage as
+      unique to the sentinel.
+
+      ── COST THIS MIGRATION ITSELF INCURS: SUPERADMIN WRITES TO MIGRATED ROWS ────
+      Disclosed, not hidden, and MEASURED (`DefaultDomainRestampChangesetTest`
+      → `SuperadminCostOfMigrating`): after the re-stamp, a SUPERADMIN can no longer
+      WRITE the rows it moved.
+
+      `PrincipalDomain.forScope` returns null for a SUPERADMIN (the cross-domain read
+      bypass), and every WRITE path coerces that null to `DomainRegistry.DEFAULT_DOMAIN`
+      — WikiPageRepository:104 (create), :132 (updateBySlug), :151 (publishBySlug),
+      :164 (deleteBySlugAndDomain), WikiAttachmentRepository:93/117,
+      WikiAuditLogRepository:60, WikiAccessRepository:70. So a SUPERADMIN write is
+      literally `... WHERE domain = 'default'`, and after this migration there are no
+      'default' rows left for it to match. Concretely, on a migrated page a SUPERADMIN's
+      update answers a nonsense 409, their publish a 404, and their delete answers 204
+      having deleted nothing.
+
+      This is the SAME cost the rejected sentinel would have carried; it is not a reason
+      to prefer either. The brand's own scoped ADMIN/EDITOR principals DO regain full
+      write access to every migrated row, which is what makes the brand the right target.
+      The residual SUPERADMIN gap is issue #15 (SUPERADMIN writes must use the null
+      cross-domain scope instead of coercing to DEFAULT_DOMAIN); #15 must land before a
+      SUPERADMIN can administer a post-cut-over deployment. That caveat applies to the
+      MIGRATED rows just as much as to the rows this migration deliberately leaves alone.
+
+      ── WHAT THIS TOUCHES (exhaustive) ──────────────────────────────────────────
+      Only the `domain` column, only where it equals the literal 'default', in the four
+      tables that carry one:
+
+        wiki_page.domain        (001)  — the pages themselves
+        wiki_attachment.domain  (002)  — the denormalised copy of the owning page's
+                                         domain; attachment reads scope on THIS column
+                                         (`WikiAttachmentDataRepository`: the JOIN
+                                         predicate is `a.domain = :domain`, not
+                                         `p.domain`), so leaving it behind would strand
+                                         every attachment of a migrated page
+        wiki_audit_log.domain   (003)  — the content-edit trail. Included because these
+                                         rows are not being FALSIFIED: they always
+                                         belonged to this one brand, whose NAME is what
+                                         is changing. Stranding them hides the brand's
+                                         own history from its own admins.
+        wiki_access.domain      (004)  — the grant / timeout / BAN overlay. The
+                                         security-critical one (see above).
+
+      No row is created, deleted, or altered in any other column. No DDL. Ids, slugs,
+      versions, content, timestamps and `state` are untouched.
+
+      NOT touched: rows whose domain is anything other than 'default' (they already name
+      a real brand, or the `__deny__` fail-closed sentinel, and are left exactly as they
+      are), and every other table/column in the schema.
+
+      ── PROVING THE SELECTION ───────────────────────────────────────────────────
+      The predicate is `WHERE domain = 'default'` — a literal equality on a NOT NULL
+      column, so it is total and unambiguous. Its correctness rests on ONE claim: that
+      on the deployment being cut over, EVERY 'default' row belongs to the single brand
+      being named. That holds because with `APP_TENANCY_ISSUERS` unset there is exactly
+      one issuer and `domainOf()` returns "default" for every principal, so 'default' is
+      that brand's only possible stamp.
+
+      This is asserted, not assumed, by `DefaultDomainRestampChangesetTest`, which drives
+      THIS changelog over a real Postgres: un-armed leaves every row at 'default' and the
+      changeset PENDING; armed moves every 'default' row in all four tables to the target
+      and leaves other brands' rows byte-identical; the rollback returns them.
+
+      Known limitation, stated rather than papered over: on an ALREADY multi-brand
+      cluster, 'default' rows can also be produced by a SUPERADMIN write (their scope is
+      null and `WikiPageRepository` coerces it to DEFAULT_DOMAIN). For THAT population
+      the intended brand really is unrecoverable, and this migration is not the tool —
+      running it there would sweep SUPERADMIN-authored rows into whichever brand was
+      named. Arm this only on a cluster that is single-issuer TODAY.
+
+      ── THE FORWARD RUN CAN COLLIDE, AND THAT IS A BOOT FAILURE ─────────────────
+      If a row already at `<brand>` shares a unique key with a 'default' row being moved
+      onto it, the UPDATE violates `uq_wiki_page_domain_slug` (same slug at both stamps)
+      or `uq_wiki_access_active` (same subject+access_type active at both). The run then
+      throws `liquibase.exception.DatabaseException: ERROR: duplicate key value violates
+      unique constraint ...`.
+
+      Atomicity holds — proven by `DefaultDomainRestampChangesetTest`
+      → `ForwardCollisionFailsLoudlyAndAtomically`: the transaction rolls back, every row
+      keeps its pre-migration stamp, and the changeset is still absent from
+      `databasechangelog`, so nothing is half-migrated and the migration can be re-run
+      once the collision is resolved. But because Liquibase runs at application startup,
+      the operator sees this as THE APPLICATION FAILING TO BOOT, not as a migration
+      warning. Budget for that in the maintenance window.
+
+      The precondition for a collision is precisely the "already multi-brand" state the
+      known limitation above admits can exist, so on any cluster you are not certain is
+      single-issuer today, check first:
+
+        SELECT domain, count(*) FROM wiki_page   GROUP BY domain;
+        SELECT domain, count(*) FROM wiki_access GROUP BY domain;
+
+      Exactly one row, reading `default`, is the safe state.
+
+      ── ARMING ──────────────────────────────────────────────────────────────────
+      Supply the Liquibase changelog parameter `wiki.restamp.target.domain`, e.g.
+
+          spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
+
+      matching the brand half of the `APP_TENANCY_ISSUERS` pair you are about to set.
+      The value must satisfy `DomainRegistry.sanitize()`'s output alphabet
+      (`^[a-z0-9-]{1,64}$`) — the registry lower-cases and replaces every other
+      character, so "Brand A" configured there becomes "brand-a", and re-stamping to
+      "Brand A" here would strand the rows in a domain no principal can ever resolve.
+      A value that is absent, blank, "default", or outside that alphabet leaves the
+      changeset UNRUN and PENDING (onFail="CONTINUE", not MARK_RAN — a cut-over happens
+      later than the first boot, so the changeset must survive every un-armed run and
+      still be available when it is finally armed).
+
+      On the ordering of that check, stated plainly: Liquibase changelog parameters are
+      TEXTUAL substitution and `sqlCheck` has no bind-parameter form, so the operator's
+      raw value is spliced into the very regex check meant to sanitise it. The chain
+      still fails CLOSED, and that is measured, not assumed
+      (`DefaultDomainRestampChangesetTest` → `ArmingParameterFailsClosed`): an
+      injection-shaped value makes the precondition SQL itself unparseable, `onError`
+      ="CONTINUE" swallows it, and because the precondition did not PASS the `<sql>`
+      block — the only place the value reaches an UPDATE — never runs at all. The
+      operator supplying this parameter already owns the database, so this is an
+      ordering wart, not a privilege boundary; it is documented so nobody later mistakes
+      the regex for a sanitiser applied before substitution.
+
+      ORDER OF OPERATIONS at cut-over: run this migration FIRST, then set
+      `APP_TENANCY_ISSUERS`. Between the two the brand's rows are unreachable, so do it
+      in one maintenance window.
+
+      ── ROLLBACK ────────────────────────────────────────────────────────────────
+      The inverse re-stamp, `<brand>` -> 'default', over the same four tables. It is
+      EXACT only while no row has been written to `<brand>` since the migration ran —
+      i.e. roll back BEFORE setting `APP_TENANCY_ISSUERS`, or accept that
+      post-cut-over writes are dragged back to 'default' too. The SAME
+      `wiki.restamp.target.domain` parameter must be supplied to the rollback run — the
+      rollback statements are re-parsed from this changelog, so without it they would
+      predicate on the literal, un-substituted placeholder and match nothing.
+
+      PREFER `liquibase rollback-count 1`. Immediately after the armed run the re-stamp
+      is the last changeset executed, so `rollback-count 1` undoes exactly it and can
+      touch nothing else. That is the primary documented undo.
+
+      `rollback-to-tag pre-default-domain-restamp` also works, but understand its blast
+      radius: rollback-to-tag reverses EVERYTHING recorded after the tag, in reverse
+      order. That is safe here only because of how the tag is timed — see the tagging
+      changeSet below — and only while nothing has been deployed since the cut-over. If
+      changesets 008+ have landed and run AFTER the cut-over, rollback-to-tag would take
+      them with it; use rollback-count in that case.
+
+      If a rollback would violate `uq_wiki_page_domain_slug` or `uq_wiki_access_active`
+      (because a 'default' row sharing the key was written after the migration), the
+      statement FAILS and the transaction is rolled back. That is deliberate: a loud
+      failure beats a silent merge of two brands' rows. (The forward run has the same
+      hazard for the mirror-image reason — see the collision section above.)
+      ══════════════════════════════════════════════════════════════════════════════
+    -->
+
+    <!--
+      THE NAMED ROLLBACK POINT — and note WHEN it is laid down.
+
+      This tagging changeSet carries the SAME arming precondition as the re-stamp below,
+      so it runs in the ARMED cut-over run, immediately before the re-stamp, and not one
+      deployment earlier. That timing is the whole point:
+
+        * An UNGATED tag would execute once, at the FIRST deployment of this changelog —
+          potentially months before the cut-over. Every changeset 008+ that landed in
+          between would then be recorded AFTER the tag, and the `rollback-to-tag` command
+          the README hands the operator would reverse those schema changes as well as the
+          re-stamp. Gated, the tag is written during the cut-over run itself, so
+          everything that landed before the cut-over sits BEFORE it and is out of reach.
+
+        * `runAlways="true"` (Liquibase's usual advice for tagDatabase) is WRONG here and
+          was rejected after measuring it: runAlways re-executes the tag on every
+          deployment and re-writes its ORDEREXECUTED to the current position, so the
+          first deployment AFTER the cut-over would silently slide the tag PAST the
+          re-stamp and turn `rollback-to-tag` into a no-op for the one changeset it
+          exists to undo. `TagIsLaidDownAtTheCutOverRun` asserts the opposite property —
+          the tag still precedes the re-stamp after a further deployment — and that
+          assertion fails if anyone adds runAlways later.
+
+      Consequence, stated so it is not a surprise: on an un-armed deployment NO tag is
+      laid down. That is correct — before the cut-over there is nothing to roll back to,
+      and a tag that names a migration which has not run is a trap, not a safety net.
+    -->
+    <!-- (No <comment> here: the dbchangelog XSD makes <tagDatabase> an EXCLUSIVE choice
+         against every other changeSet child EXCEPT validCheckSum and preConditions, which
+         sit in the sequence before it — so a tagging changeSet may be gated, but must
+         contain the tag and no <comment>.) -->
+    <changeSet id="007-tag-before-default-domain-restamp" author="hugmesh">
+        <preConditions onFail="CONTINUE" onError="CONTINUE"
+                       onFailMessage="wiki-bff 007: multi-brand cut-over NOT armed, so the pre-re-stamp rollback tag is deliberately NOT laid down. It is written during the armed cut-over run, immediately before the re-stamp, so that rollback-to-tag cannot reach changesets that landed before the cut-over."
+                       onErrorMessage="wiki-bff 007: could not evaluate the arming precondition for the rollback tag. Leaving it un-tagged, consistent with the re-stamp being left PENDING.">
+            <and>
+                <dbms type="postgresql"/>
+                <changeLogPropertyDefined property="wiki.restamp.target.domain"/>
+                <not>
+                    <changeLogPropertyDefined property="wiki.restamp.target.domain" value="default"/>
+                </not>
+                <sqlCheck expectedResult="1">
+                    SELECT CASE WHEN '${wiki.restamp.target.domain}' ~ '^[a-z0-9-]{1,64}$'
+                                THEN 1 ELSE 0 END
+                </sqlCheck>
+            </and>
+        </preConditions>
+        <tagDatabase tag="pre-default-domain-restamp"/>
+    </changeSet>
+
+    <changeSet id="007-restamp-default-domain-to-brand" author="hugmesh">
+        <!-- INERT UNLESS ARMED. onFail=CONTINUE (NOT MARK_RAN): an un-armed run must
+             leave the changeset PENDING so a later cut-over can still run it. onError
+             =CONTINUE covers a store where the regex operator below cannot be evaluated
+             — the dbms gate is checked first, but an unexpected error must also leave
+             the data untouched rather than half-migrated. This precondition is character
+             -for-character the one on the tagging changeSet above, so the tag and the
+             re-stamp arm and disarm together. -->
+        <preConditions onFail="CONTINUE" onError="CONTINUE"
+                       onFailMessage="wiki-bff 007: multi-brand cut-over re-stamp NOT armed. Set the Liquibase parameter wiki.restamp.target.domain to the brand from your APP_TENANCY_ISSUERS pair (it must match ^[a-z0-9-]{1,64}$ and must not be 'default'). The changeset stays PENDING until then."
+                       onErrorMessage="wiki-bff 007: could not evaluate the arming precondition. Leaving the multi-brand cut-over re-stamp PENDING and the data untouched.">
+            <and>
+                <!-- Production and the slice-test store are both Postgres; the regex
+                     check below is Postgres syntax. Checked first so a non-Postgres
+                     store fails the AND before the sqlCheck is reached. -->
+                <dbms type="postgresql"/>
+                <changeLogPropertyDefined property="wiki.restamp.target.domain"/>
+                <not>
+                    <changeLogPropertyDefined property="wiki.restamp.target.domain" value="default"/>
+                </not>
+                <!-- The target must be spellable by DomainRegistry.sanitize(): it
+                     lower-cases and replaces every character outside [a-z0-9-], so a
+                     value this rejects is a value no JWT issuer can ever resolve to,
+                     and re-stamping to it would strand the rows permanently. -->
+                <sqlCheck expectedResult="1">
+                    SELECT CASE WHEN '${wiki.restamp.target.domain}' ~ '^[a-z0-9-]{1,64}$'
+                                THEN 1 ELSE 0 END
+                </sqlCheck>
+            </and>
+        </preConditions>
+
+        <comment>Multi-brand cut-over: re-stamp every domain='default' row in wiki_page,
+                 wiki_attachment, wiki_audit_log and wiki_access to the operator-supplied
+                 brand. One transaction — all four tables move together or none do.</comment>
+
+        <!-- The four statements are independent (each predicates on its OWN table's
+             domain column, none on a join), so the order below is for readability only.
+             They run in ONE transaction (Liquibase's default runInTransaction=true), so
+             the ACL overlay can never be left behind by a partial failure — and so a
+             unique-constraint collision on any one of them leaves ALL four untouched. -->
+        <sql>
+            UPDATE wiki_page      SET domain = '${wiki.restamp.target.domain}' WHERE domain = 'default';
+            UPDATE wiki_attachment SET domain = '${wiki.restamp.target.domain}' WHERE domain = 'default';
+            UPDATE wiki_audit_log SET domain = '${wiki.restamp.target.domain}' WHERE domain = 'default';
+            UPDATE wiki_access    SET domain = '${wiki.restamp.target.domain}' WHERE domain = 'default';
+        </sql>
+
+        <rollback>
+            <sql>
+                UPDATE wiki_access    SET domain = 'default' WHERE domain = '${wiki.restamp.target.domain}';
+                UPDATE wiki_audit_log SET domain = 'default' WHERE domain = '${wiki.restamp.target.domain}';
+                UPDATE wiki_attachment SET domain = 'default' WHERE domain = '${wiki.restamp.target.domain}';
+                UPDATE wiki_page      SET domain = 'default' WHERE domain = '${wiki.restamp.target.domain}';
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
