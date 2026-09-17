@@ -30,7 +30,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class RestampTargetEnvironmentPostProcessorTest {
 
-    private static final String ISSUER = "https://id.hugmesh.net";
+    /**
+     * The issuer this resource server trusts AND the issuer named in the pair below —
+     * deliberately the same string. With exactly one pair the single-issuer decoder is in
+     * force, so the derivation refuses to arm on a pair naming any other issuer; a test
+     * that mismatched them (this one used to) would be measuring a configuration that
+     * cannot arm and calling it the happy path.
+     */
+    private static final String ISSUER = "https://id.acme.test";
 
     private static RestampTargetEnvironmentPostProcessor processor() {
         return new RestampTargetEnvironmentPostProcessor(new DeferredLogs());
@@ -47,7 +54,7 @@ class RestampTargetEnvironmentPostProcessorTest {
     void aDerivedTargetIsContributedAtTheVeryBOTTOMOfThePropertySources() {
         StandardEnvironment env = envWith(Map.of(
                 ISSUER_URI_PROPERTY, ISSUER,
-                ISSUERS_PROPERTY, "https://id.acme.test=acme"));
+                ISSUERS_PROPERTY, ISSUER + "=acme"));
 
         processor().postProcessEnvironment(env, null);
 
@@ -70,7 +77,7 @@ class RestampTargetEnvironmentPostProcessorTest {
         // sources attached later still.
         StandardEnvironment env = envWith(Map.of(
                 ISSUER_URI_PROPERTY, ISSUER,
-                ISSUERS_PROPERTY, "https://id.acme.test=acme",
+                ISSUERS_PROPERTY, ISSUER + "=acme",
                 TARGET_PROPERTY, "typed-by-hand"));
 
         processor().postProcessEnvironment(env, null);
@@ -86,7 +93,7 @@ class RestampTargetEnvironmentPostProcessorTest {
     void aBlankExplicitValueIsNotTreatedAsAnOverride() {
         StandardEnvironment env = envWith(Map.of(
                 ISSUER_URI_PROPERTY, ISSUER,
-                ISSUERS_PROPERTY, "https://id.acme.test=acme",
+                ISSUERS_PROPERTY, ISSUER + "=acme",
                 TARGET_PROPERTY, "   "));
 
         processor().postProcessEnvironment(env, null);
@@ -95,10 +102,27 @@ class RestampTargetEnvironmentPostProcessorTest {
                 .as("a blank value arms nothing (007's regex rejects it), so it must not"
                         + " suppress the derivation and leave the cut-over silently inert."
                         + " An empty SPRING_LIQUIBASE_PARAMETERS_* env var is the reachable"
-                        + " shape — the platform manifest already ships APP_TENANCY_ISSUERS"
-                        + " exactly that way. This assertion FAILED on the first run: the"
+                        + " shape — a templated Deployment entry whose source value is unset"
+                        + " produces exactly it. This assertion FAILED on the first run: the"
                         + " blank outranked the addLast contribution and won.")
                 .isEqualTo("acme");
+    }
+
+    @Test
+    void aSinglePairOnAnUntrustedIssuerContributesNothing() {
+        // One pair leaves isMultiIssuer() false, so only tokens whose iss equals the
+        // issuer-uri validate. A pair naming a different URL for the same Casdoor derives a
+        // clean brand string that no principal resolves, and arming there would re-stamp
+        // the whole wiki behind a __deny__ predicate. Pinned here as well as in
+        // WikiLaunchDomainTest because this class is the only thing that can publish it.
+        StandardEnvironment env = envWith(Map.of(
+                ISSUER_URI_PROPERTY, "https://id.hugmesh.net",
+                ISSUERS_PROPERTY, "https://casdoor.internal:8000=acme"));
+
+        processor().postProcessEnvironment(env, null);
+
+        assertThat(env.getPropertySources().contains(SOURCE_NAME)).isFalse();
+        assertThat(env.getProperty(TARGET_PROPERTY)).isNull();
     }
 
     @Test

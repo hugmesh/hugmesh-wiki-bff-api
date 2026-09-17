@@ -348,18 +348,33 @@ same boot that configures it. There is no window between the two and nothing to 
 > to run the migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an
 > un-armed run publishes no target and migrates nothing.
 
-It arms **only** when the mapping names exactly one brand:
+It arms **only** when the mapping holds exactly one pair, **and that pair names the issuer
+this resource server trusts** (`CASDOOR_ISSUER_URI`):
 
-| `APP_TENANCY_ISSUERS`        | every principal resolves | re-stamp target | arms? |
-| ---------------------------- | ------------------------ | --------------- | ----- |
-| unset / no valid pair        | `default`                | none            | no    |
-| one pair `https://i=brand-a` | `brand-a`                | `brand-a`       | **yes** |
-| two or more pairs            | per-issuer brand         | none            | no    |
+| `APP_TENANCY_ISSUERS`                           | every principal resolves | re-stamp target | arms? |
+| ----------------------------------------------- | ------------------------ | --------------- | ----- |
+| unset / no valid pair                           | `default`                | none            | no    |
+| one pair `https://i=brand-a`, `i` == issuer-uri | `brand-a`                | `brand-a`       | **yes** |
+| one pair `https://j=brand-a`, `j` != issuer-uri | *nothing* (fail-closed)  | none            | no    |
+| two or more **pairs** (any number of brands)    | per-issuer brand         | none            | no    |
+
+The last two rows count **pairs**, not distinct brands. Two pairs naming the same brand are
+two pairs, and they do not arm.
+
+**A single pair on the wrong issuer does not arm, and this is the sharp one.** One pair
+leaves `isMultiIssuer()` false, so `SecurityConfig` keeps the single-issuer
+`o.jwt(issuer-uri)` decoder: the only tokens that validate are those carrying
+`iss = CASDOOR_ISSUER_URI`. Point the pair at a *different* URL for the same Casdoor — the
+compose stack's published `http://localhost:8000` versus the in-network
+`http://casdoor:8000` is exactly this trap — and the brand parses perfectly while
+`domainOf(issuer-uri)` is `null`, so every principal resolves the `__deny__` sentinel.
+Arming there would re-stamp the whole wiki into a domain nobody can reach. The derivation
+therefore requires `brand == domainOf(CASDOOR_ISSUER_URI)` before it arms.
 
 **Unset does not arm, and that is deliberate.** With nothing configured every principal
 already resolves `default` — the stamp the rows already carry — so there is nothing to
 re-stamp. The launch domain is reported as `hugmesh` (`WikiLaunchDomain.FALLBACK_DOMAIN`,
-per the operator: *"hugmesh is teh default"*), but it is **not** written to the rows:
+per the operator: *"hugmesh is the default"*), but it is **not** written to the rows:
 doing that while the runtime still resolves `default` would strand the entire wiki behind
 a predicate nobody matches. `hugmesh` becomes the live launch domain the moment you name
 it — `APP_TENANCY_ISSUERS=https://casdoor.hugmesh.example.com=hugmesh` — and then it arms
@@ -367,10 +382,20 @@ like any other brand. It is deliberately *not* made live by changing
 `DomainRegistry.DEFAULT_DOMAIN`, which admin-bff, federation-api, user-bff, owncast-bff
 and forum-bff all share and none of which has a re-stamp migration of its own.
 
-**Two or more does not arm** because there is no single launch domain, and because on an
-already-multi-brand cluster `default` rows can also be written by a SUPERADMIN (see the
-SUPERADMIN note below), so an auto-armed run would sweep those into whichever brand
-sorted first.
+**Two or more pairs does not arm** because — with two or more *brands* — there is no
+single launch domain, and because on an already-multi-brand cluster `default` rows can also
+be written by a SUPERADMIN (see the SUPERADMIN note below), so an auto-armed run would
+sweep those into whichever brand sorted first. Two pairs naming *one* brand are refused for
+the second reason alone: the value is unambiguous, but `isMultiIssuer()` is already true, so
+this is that same already-multi-brand cluster. Use the manual override there.
+
+> **What the config-shape rule cannot see** (hugmesh-wiki-bff-api#22). The
+> SUPERADMIN-authored-`default`-row hazard is a property of the **data**; every rule above
+> is a property of the **configuration**, and the data outlives the shape. If you run two
+> brands, let a SUPERADMIN author content, then *narrow* `APP_TENANCY_ISSUERS` back to one
+> pair, the derivation arms — 007 is still `PENDING`, it never ran under the refused shape —
+> and sweeps those rows into the surviving brand. Run the pre-flight below before any
+> narrowing, not just before a first cut-over.
 
 **Manual override still works** and is the escape hatch for both refused shapes — set
 `spring.liquibase.parameters.wiki.restamp.target.domain` (or the
@@ -391,6 +416,25 @@ resolves `brand-b`, and a silent skip would hide an emptied wiki until users rep
 A post-cut-over rename is a real data migration this changeset does not perform; resolve
 it deliberately (re-stamp `brand-a` -> `brand-b`, then `changelogSync`), never by
 relaxing the checksum. Redeploying *unchanged* is a safe no-op.
+
+**After the cut-over, `APP_TENANCY_ISSUERS` is load-bearing for STARTUP — pin the brand.**
+The same checksum guard that makes a rename fail loudly also fires when the derivation
+stops arming at all. **Un-setting** the variable ("turn multi-brand back off", a reverted
+manifest, ArgoCD `selfHeal` undoing a manual `kubectl set env`) and **adding a second
+brand** — the documented multi-brand growth path — both publish *no* parameter, so the
+recorded checksum no longer matches and the pod crashloops on
+`ValidationFailedException: ... 007-restamp-default-domain-to-brand ... check sum ...`.
+Nothing is migrated and nothing is lost, but the error names a checksum, not the config
+change, so it does not look like what it is. Measured in
+`DerivedTargetRerunTest.unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned`.
+
+> **So make the cut-over two env vars, not one.** Once the armed boot has succeeded, set
+> `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand>` **permanently** and leave
+> it there. The explicit override wins on every later boot regardless of what the derivation
+> says, so `APP_TENANCY_ISSUERS` goes back to being an ordinary scoping knob. If you are
+> already crashlooping, that one variable — set to the brand the *forward run* used, which
+> the cut-over boot log records verbatim — is the fix; `liquibase rollback-count 1
+> -Dwiki.restamp.target.domain=<brand>` followed by `changelogSync` is the undo.
 
 **Before you arm it, check the cluster really is single-brand.** If a row already stamped
 `<brand>` shares a unique key with a `default` row being moved onto it, the forward UPDATE
@@ -413,9 +457,11 @@ un-substituted placeholder and match nothing. **The derivation does not help her
 `RestampTargetEnvironmentPostProcessor` is a Spring Boot `EnvironmentPostProcessor`, so it
 runs only when the *application* boots. A rollback driven from the Liquibase CLI or Maven
 plugin must pass the brand explicitly, and it must be the brand the forward run actually
-used — the cut-over boot log records it verbatim; `databasechangelog` does not. Roll back
-**before** the cut-over boot if you can; afterwards the inverse re-stamp drags
-post-cut-over writes back to `default` too.
+used — the cut-over boot log records it verbatim; `databasechangelog` does not. The
+rollback is **exact** only while nothing has been written under the new brand: run it
+immediately after the cut-over boot, before the application starts serving, or accept that
+the inverse re-stamp drags post-cut-over writes back to `default` too. (There is nothing to
+roll back *before* the cut-over boot — the changeset has not run.)
 
 ```sh
 # preferred: immediately after the armed run the re-stamp is the last changeset executed,

@@ -163,7 +163,7 @@
       Exactly one row, reading `default`, is the safe state.
 
       ── ARMING: DERIVED AT BOOT, NOT TYPED (issue #19, operator answer) ─────────
-      The operator's answer on hugmesh-generator#347 was "hugmesh is teh default but
+      The operator's answer on hugmesh-generator#347 was "hugmesh is the default but
       should always take what domain the wiki is launched on", so the brand is no longer
       typed. `RestampTargetEnvironmentPostProcessor` (registered in
       META-INF/spring.factories) runs before Liquibase binds its parameters and publishes
@@ -174,13 +174,26 @@
       could drift from it over trailing slashes, `sanitize()`'s lower-casing, or its
       `[^a-z0-9-] -> '-'` replacement.
 
-      Three configuration shapes, and only one arms:
+      Four configuration shapes, and only one arms. NOTE THE LAST TWO ROWS COUNT PAIRS,
+      NOT DISTINCT BRANDS: two pairs naming the same brand are two pairs, and do not arm.
 
-        app.tenancy.issuers        | runtime domainOf() | target published | arms?
-        ───────────────────────────┼────────────────────┼──────────────────┼──────
-        unset / no valid pair      | "default"          | none             | NO
-        ONE pair "https://i=acme"  | "acme"             | "acme"           | YES
-        two or more pairs          | per-issuer brand   | none             | NO
+        app.tenancy.issuers                 | runtime domainOf() | published | arms?
+        ────────────────────────────────────┼────────────────────┼───────────┼──────
+        unset / no valid pair               | "default"          | none      | NO
+        ONE pair, issuer == issuer-uri      | "acme"             | "acme"    | YES
+        ONE pair, issuer != issuer-uri      | null (fail-closed) | none      | NO
+        TWO OR MORE pairs, any brand count  | per-issuer brand   | none      | NO
+
+      A SINGLE PAIR ON AN ISSUER THIS RESOURCE SERVER DOES NOT TRUST does not arm, and
+      that check is why. With one pair DomainRegistry.isMultiIssuer() is false, so
+      SecurityConfig keeps the single-issuer o.jwt(issuer-uri) decoder and the only tokens
+      that validate carry iss = spring.security.oauth2.resourceserver.jwt.issuer-uri. Name
+      a different URL for the same Casdoor in the pair — the compose stack's published
+      http://localhost:8000 versus the in-network http://casdoor:8000 is exactly this
+      confusion, see application.yml — and the brand parses perfectly while
+      domainOf(issuer-uri) is null and every principal resolves the __deny__ sentinel.
+      Arming there re-stamps the whole wiki into a domain nobody can reach. So the
+      derivation additionally requires brand == domainOf(issuer-uri) before arming.
 
       UNSET does not arm, and this is the point the fallback turns on. With nothing
       configured every principal resolves the literal 'default' — which is exactly what
@@ -198,18 +211,34 @@
       of domain='default' rows and NO re-stamp migration of its own, so changing it would
       strand five other services' data in order to rename this one's. See issue #19.
 
-      TWO OR MORE does not arm because there is no single domain the wiki is launched on,
-      and because on an already-multi-brand cluster 'default' rows can also be minted by a
+      TWO OR MORE PAIRS does not arm. With two or more BRANDS there is no single domain
+      the wiki is launched on. With two or more pairs naming ONE brand the value is not
+      ambiguous — every principal resolves it — but isMultiIssuer() is already true, and
+      that is the already-multi-brand cluster where 'default' rows can also be minted by a
       SUPERADMIN write (their scope is null and the repositories coerce it to
-      DEFAULT_DOMAIN), so an auto-armed run would sweep SUPERADMIN-authored rows into
-      whichever brand sorted first.
+      DEFAULT_DOMAIN); an auto-armed run would sweep SUPERADMIN-authored rows up with the
+      legacy ones. Refusing both keeps the rule above literally true, and the manual
+      override below remains for a deliberate multi-issuer cut-over.
+
+      WHAT THE CONFIG-SHAPE RULE CANNOT SEE (issue #22). That SUPERADMIN-row hazard is a
+      property of the DATA; every rule above is a property of the CONFIGURATION, and the
+      data outlives the shape. Narrowing app.tenancy.issuers from two-or-more pairs down
+      to one — decommissioning a brand — leaves this changeset still PENDING, because it
+      never ran under the refused shape, so the next boot arms and sweeps whatever
+      'default' rows that cluster accumulated. Run the pre-flight above before any
+      narrowing, not only before a first cut-over.
 
       MANUAL OVERRIDE, unchanged from PR #20 and still the escape hatch for both refused
-      shapes: set the parameter yourself and it wins. The derived value is contributed with
-      `addLast`, i.e. lowest precedence, so an application.yml entry, a
-      SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN environment variable, a -D
-      system property or a test's inlined properties all beat it with no ordering
-      assumption. The value must still satisfy `^[a-z0-9-]{1,64}$` and must not be
+      shapes: set the parameter yourself and it wins. The override is honoured by an
+      explicit CHECK in the post-processor — a non-blank value readable there makes it
+      contribute nothing at all — and the derived value is ADDITIONALLY contributed with
+      `addLast`, i.e. lowest precedence, as a second line of defence covering sources
+      attached after post-processors run. One exception, because blank is not an override
+      but does outrank a lowest-precedence contribution: a PRESENT-BUT-BLANK explicit value
+      (the shape a templated Deployment entry produces when its source is unset) would
+      otherwise leave the blank in force, 007's regex would reject it, and the cut-over
+      would be SILENTLY inert with the brand correctly configured — so that case, and only
+      it, is contributed with `addFirst` instead. The value must still satisfy `^[a-z0-9-]{1,64}$` and must not be
       'default'; a value that is absent, blank, 'default' or outside that alphabet leaves
       the changeset UNRUN and PENDING (onFail="CONTINUE", not MARK_RAN — a cut-over happens
       later than the first boot, so the changeset must survive every un-armed run and still
@@ -242,10 +271,10 @@
       sequence. Budget for the boot to fail if the forward run collides (see above) — that
       is the one case where the maintenance window still matters.
 
-      ── THE SECOND BOOT, AND WHAT A BRAND RENAME DOES (MEASURED) ────────────────
+      ── THE SECOND BOOT: RENAME, AND UN-ARM (BOTH MEASURED) ─────────────────────
       Because the target now moves with configuration rather than with a human retyping it,
-      two redeploy sequences are reachable that were not before. `DerivedTargetRerunTest`
-      measures both against a real Postgres:
+      THREE redeploy sequences are reachable that were not before. `DerivedTargetRerunTest`
+      measures all three against a real Postgres:
 
         * REDEPLOY UNCHANGED — safe no-op. The changeset is already recorded, so it does not
           re-run; it does not throw, and a 'default' row written AFTER the cut-over (e.g. by
@@ -264,11 +293,30 @@
           changeset does not perform — resolve it deliberately (re-stamp acme -> globex and
           `changelogSync`), never by relaxing the checksum.
 
+        * UN-ARM AFTER THE CUT-OVER AND REDEPLOY — ALSO REFUSED STARTUP, and this is the
+          one an operator will not expect. Emptying APP_TENANCY_ISSUERS ("turn multi-brand
+          back off", a reverted manifest, ArgoCD selfHeal undoing a manual kubectl set env)
+          and ADDING A SECOND BRAND — the documented multi-brand growth path — both make
+          the derivation refuse to arm, so the post-processor publishes NOTHING. The
+          recorded checksum embedded the brand, so validation fails exactly as it does for
+          a rename, and the pod crashloops on an error that names a checksum rather than
+          the configuration change that caused it. Nothing is migrated and nothing is lost.
+
+          CONSEQUENCE, AND THE REASON THE CUT-OVER IS TWO VARIABLES AND NOT ONE: once this
+          changeset has run, the brand is load-bearing for STARTUP, not just for scoping.
+          Set SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand> permanently
+          after the armed boot succeeds and leave it there; the explicit override wins on
+          every later boot regardless of what the derivation says, and APP_TENANCY_ISSUERS
+          goes back to being an ordinary scoping knob. If you are already crashlooping,
+          that one variable — set to the brand the FORWARD run used, which the cut-over
+          boot log records verbatim — is the fix.
+
       ── ROLLBACK ────────────────────────────────────────────────────────────────
       The inverse re-stamp, `<brand>` -> 'default', over the same four tables. It is
       EXACT only while no row has been written to `<brand>` since the migration ran —
-      i.e. roll back BEFORE setting `APP_TENANCY_ISSUERS`, or accept that
-      post-cut-over writes are dragged back to 'default' too. The SAME
+      i.e. roll back IMMEDIATELY AFTER the cut-over boot, before the application serves,
+      or accept that post-cut-over writes are dragged back to 'default' too. (There is
+      nothing to roll back BEFORE that boot: the changeset has not run.) The SAME
       `wiki.restamp.target.domain` parameter must be supplied to the rollback run — the
       rollback statements are re-parsed from this changelog, so without it they would
       predicate on the literal, un-substituted placeholder and match nothing. NOTE THE

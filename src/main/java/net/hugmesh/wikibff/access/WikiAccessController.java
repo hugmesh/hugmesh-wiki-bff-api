@@ -7,6 +7,7 @@ import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
@@ -61,13 +62,19 @@ public class WikiAccessController {
      * Constructs the controller with its dependencies.
      *
      * @param access   the service that owns all {@code wiki_access} read/write logic
-     * @param registry the issuer-to-brand registry, from which the target-brand catalogue is
-     *                 derived; the same bean {@code SecurityConfig} imports and the write path
-     *                 validates against
+     * @param registry  the issuer-to-brand registry, from which the target-brand catalogue is
+     *                  derived; the same bean {@code SecurityConfig} imports and the write path
+     *                  validates against
+     * @param issuerUri the single issuer this resource server trusts, needed so the
+     *                  catalogue's {@code launchDomain} is the SAME derivation the boot-time
+     *                  007 re-stamp target used (issue #19) rather than a second opinion
      */
-    public WikiAccessController(WikiAccessService access, DomainRegistry registry) {
+    public WikiAccessController(
+            WikiAccessService access,
+            DomainRegistry registry,
+            @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri:}") String issuerUri) {
         this.access = access;
-        this.brands = new WikiBrandCatalog(registry);
+        this.brands = new WikiBrandCatalog(registry, issuerUri);
     }
 
     // ── grant / timeout / ban / restore (WIKI_WRITE) ───────────────────

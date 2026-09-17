@@ -34,7 +34,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * assertion that would fail if someone later "finished the job" by publishing the
  * fallback as an armed target, which is precisely the mistake worth pinning down.
  *
+ * <p>SCOPE, stated because reading more into it is exactly the mistake a skeptic pass
+ * caught: this proves PENDING on a database where the cut-over has NEVER RUN. It says
+ * NOTHING about an un-armed boot against a database where it HAS run — there the recorded
+ * checksum embeds the brand, no parameter is published, and Liquibase REFUSES the startup.
+ * PENDING is true before the cut-over and false after it, and only
+ * {@link DerivedTargetRerunTest#unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned()}
+ * distinguishes the two.
+ *
  * @see DerivedRestampTargetBootTest for the armed half
+ * @see DerivedTargetRerunTest for what un-arming does AFTER a cut-over
  */
 @SpringBootTest
 @ActiveProfiles("test")

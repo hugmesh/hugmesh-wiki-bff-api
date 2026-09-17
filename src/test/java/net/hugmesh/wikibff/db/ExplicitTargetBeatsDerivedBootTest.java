@@ -17,18 +17,28 @@ import static org.assertj.core.api.Assertions.assertThat;
  * The manual override still wins over the derivation — the ONE case where both a derived
  * and an explicit target exist at once.
  *
- * <p>This matters because the override is the documented escape hatch for the two shapes
- * the derivation deliberately refuses to arm (nothing configured, and two-or-more brands),
- * and because it is what keeps PR #20's arming contract working. The claim rests entirely
- * on {@code RestampTargetEnvironmentPostProcessor} contributing its property source with
- * {@code addLast} rather than {@code addFirst}; flipping that one call silently inverts the
- * precedence and would make a derived brand quietly overrule an operator who typed
- * something else. Nothing else in the suite exercises both values at the same time, so
- * without this test that mutation survives.
+ * <p>This matters because the override is the documented escape hatch for every shape the
+ * derivation deliberately refuses to arm (nothing configured; two or more configured
+ * pairs; a single pair on an untrusted issuer), because it is what keeps PR #20's arming
+ * contract working, and because after a cut-over it is the ONLY way to keep booting once
+ * {@code APP_TENANCY_ISSUERS} changes (see {@code DerivedTargetRerunTest
+ * .unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned}).
+ *
+ * <p>What this test actually pins, stated precisely because the earlier wording here was
+ * wrong and a mutation proved it: it catches the loss of the EXPLICIT-OVERRIDE EARLY
+ * RETURN in {@code RestampTargetEnvironmentPostProcessor}. It does NOT catch
+ * {@code addLast -> addFirst} — measured: that mutation leaves this test green, because
+ * {@code @TestPropertySource} attaches its inlined properties with {@code addFirst} AFTER
+ * environment post-processors have run, so no {@code @SpringBootTest} in this repo can
+ * tell the two orderings apart. {@code RestampTargetEnvironmentPostProcessorTest} is the
+ * test that pins the ordering, on a bare {@code StandardEnvironment}. Nothing else in the
+ * suite boots with both values present at once, so without this test the early-return
+ * mutation survives.
  */
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
+        "spring.security.oauth2.resourceserver.jwt.issuer-uri=https://id.acme.test",
         "app.tenancy.issuers=https://id.acme.test=acme",
         "spring.liquibase.parameters.wiki.restamp.target.domain=typed-by-hand"})
 class ExplicitTargetBeatsDerivedBootTest extends PostgresTestSupport {

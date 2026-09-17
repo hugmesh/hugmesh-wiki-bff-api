@@ -25,9 +25,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code wiki.restamp.target.domain} supplied by anyone:
  *
  * <pre>
+ *   CASDOOR_ISSUER_URI=https://id.acme.test
  *   APP_TENANCY_ISSUERS=https://id.acme.test=acme
- *      -> DomainRegistry parses one brand, "acme"
- *      -> WikiLaunchDomain.resolve says that IS the launch domain, and arms
+ *      -> DomainRegistry parses one pair, on the trusted issuer, naming "acme"
+ *      -> WikiLaunchDomain.resolve says that IS the launch domain, and arms. The issuer-uri
+ *         is pinned to the SAME issuer on purpose: with one pair the single-issuer decoder
+ *         is in force, so a pair on any other issuer would resolve no brand at all and the
+ *         derivation refuses it (WikiLaunchDomainTest
+ *         .aSinglePairOnAnIssuerTheResourceServerDoesNotTrustMustNotArm).
  *      -> RestampTargetEnvironmentPostProcessor publishes it as
  *         spring.liquibase.parameters.wiki.restamp.target.domain
  *      -> 007's arming precondition passes
@@ -49,7 +54,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @SpringBootTest
 @ActiveProfiles("test")
-@TestPropertySource(properties = "app.tenancy.issuers=https://id.acme.test=acme")
+@TestPropertySource(properties = {
+        "spring.security.oauth2.resourceserver.jwt.issuer-uri=https://id.acme.test",
+        "app.tenancy.issuers=https://id.acme.test=acme"})
 class DerivedRestampTargetBootTest extends PostgresTestSupport {
 
     /** No live Casdoor issuer in CI — mock the decoder so the resource server wires up. */

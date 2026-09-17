@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class WikiBrandCatalogTest {
 
     private static WikiAccessDto.Brands snapshot(String issuerUri, String issuersCsv) {
-        return new WikiBrandCatalog(new DomainRegistry(issuerUri, issuersCsv)).snapshot();
+        return new WikiBrandCatalog(new DomainRegistry(issuerUri, issuersCsv), issuerUri).snapshot();
     }
 
     @Nested
@@ -77,7 +77,7 @@ class WikiBrandCatalogTest {
         void everyServedBrandIsAcceptedByTheWritePathsOwnPredicate() {
             DomainRegistry registry = new DomainRegistry("", CSV);
             PrincipalDomain principal = new PrincipalDomain(registry);
-            List<String> brands = new WikiBrandCatalog(registry).snapshot().brands();
+            List<String> brands = new WikiBrandCatalog(registry, "").snapshot().brands();
             assertThat(brands).isNotEmpty();
             for (String brand : brands) {
                 // resolveKnownDomain is exactly what WikiAccessService.writeDomain calls; a
@@ -119,11 +119,13 @@ class WikiBrandCatalogTest {
             + "brand is real (the hazard the catalogue exists to expose)")
     class SingleConfiguredPair {
 
-        private static final String CSV = "https://id.hugmesh.example=hugmesh";
+        private static final String ISSUER = "https://id.hugmesh.example";
+
+        private static final String CSV = ISSUER + "=hugmesh";
 
         @Test
         void servesTheBrand_becauseTheWritePathWouldAcceptIt() {
-            assertThat(snapshot("", CSV).brands()).containsExactly("hugmesh");
+            assertThat(snapshot(ISSUER, CSV).brands()).containsExactly("hugmesh");
         }
 
         @Test
@@ -132,21 +134,63 @@ class WikiBrandCatalogTest {
             // field here: a SUPERADMIN write is stamped 'default' whatever the picker chose.
             // This is the single-brand launch shape issue #19's derivation makes first-class,
             // so the console must be able to see it and warn instead of offering a live control.
-            assertThat(snapshot("", CSV).targetDomainHonoured()).isFalse();
+            assertThat(snapshot(ISSUER, CSV).targetDomainHonoured()).isFalse();
         }
 
         @Test
         void theBrandsListAndTheHonouredFlagDisagree_whichIsTheDetectableSignal() {
-            WikiAccessDto.Brands b = snapshot("", CSV);
+            WikiAccessDto.Brands b = snapshot(ISSUER, CSV);
             assertThat(b.brands()).isNotEmpty();
             assertThat(b.targetDomainHonoured()).isFalse();
         }
 
         @Test
         void theLaunchDomainIsTheConfiguredBrand_soAPickerCouldPreselectIt() {
-            WikiAccessDto.Brands b = snapshot("", CSV);
+            WikiAccessDto.Brands b = snapshot(ISSUER, CSV);
             assertThat(b.launchDomain()).isEqualTo("hugmesh");
             assertThat(b.brands()).contains(b.launchDomain());
+        }
+
+        @Test
+        void aPairOnAnUNTRUSTEDIssuerIsServedAsABrandButIsNOTTheLaunchDOMAIN() {
+            // The hazard skeptic pass 1 measured: with one pair, isMultiIssuer() is false, so
+            // the single-issuer decoder admits ONLY tokens whose iss equals issuer-uri. Point
+            // the pair somewhere else and no principal resolves 'acme' at all. The brand is
+            // still a legal targetDomain by the registry's own predicate, so it is still
+            // served — but the launch domain must NOT claim to be it, or the console would
+            // preselect (and the 007 derivation would re-stamp to) a domain nobody reaches.
+            WikiAccessDto.Brands b = snapshot("https://id.hugmesh.example",
+                    "https://casdoor.internal:8000=acme");
+
+            assertThat(new DomainRegistry("https://id.hugmesh.example",
+                    "https://casdoor.internal:8000=acme").domainOf("https://id.hugmesh.example"))
+                    .as("premise: the trusted issuer resolves NO brand in this configuration")
+                    .isNull();
+            assertThat(b.brands()).containsExactly("acme");
+            assertThat(b.launchDomain())
+                    .as("falls back rather than naming a brand no admitted principal resolves")
+                    .isEqualTo("hugmesh");
+            assertThat(b.brands()).doesNotContain(b.launchDomain());
+        }
+    }
+
+    @Nested
+    @DisplayName("a brand the domain column cannot hold is never offered")
+    class UnstorableBrands {
+
+        @Test
+        void aBrandLongerThanTheDomainColumnIsFilteredOut() {
+            // DomainRegistry.isKnownDomain has no length cap; every `domain` column is
+            // varchar(64). Offering a 65-character brand would hand the operator an option
+            // whose INSERT fails. WikiLaunchDomain refuses to arm on one for the same reason,
+            // so both consumers of the registry now agree about what is storable.
+            String tooLong = "a".repeat(65);
+            String csv = "https://id.a.example=" + tooLong + ",https://id.b.example=acme";
+
+            assertThat(new DomainRegistry("", csv).isKnownDomain(tooLong))
+                    .as("premise: the write path's own predicate accepts it")
+                    .isTrue();
+            assertThat(snapshot("", csv).brands()).containsExactly("acme");
         }
     }
 

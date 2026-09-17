@@ -86,7 +86,7 @@ class WikiAccessRawApiDenySliceTest extends SecuritySliceSupport {
         // registry — so a denied request can be proven to NEVER reach the repo.
         repo = mock(WikiAccessRepository.class);
         WikiAccessService service = new WikiAccessService(repo, new PrincipalDomain(registry));
-        WikiAccessController controller = new WikiAccessController(service, registry);
+        WikiAccessController controller = new WikiAccessController(service, registry, "");
 
         client = sliceClient(registry, provider(resolver), controller);
     }

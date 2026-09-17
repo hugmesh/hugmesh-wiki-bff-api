@@ -13,7 +13,7 @@ import org.springframework.core.env.MapPropertySource;
 /**
  * Publishes the 007 cut-over re-stamp target at boot, DERIVED from the domain this wiki
  * is launched on, so the operator never types a brand (issue #19; operator answer on
- * hugmesh-generator#347: <em>"hugmesh is teh default but should always take what domain
+ * hugmesh-generator#347: <em>"hugmesh is the default but should always take what domain
  * the wiki is launched on"</em>).
  *
  * <h2>What it does</h2>
@@ -33,8 +33,10 @@ import org.springframework.core.env.MapPropertySource;
  * value is already readable here — an {@code application.yml} entry, a
  * {@code SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN} environment variable, a
  * {@code -D} system property — this contributes nothing at all. That keeps PR #20's manual
- * arming contract intact as the escape hatch for the two shapes the derivation
- * deliberately refuses (nothing configured, and two-or-more brands).
+ * arming contract intact as the escape hatch for every shape the derivation deliberately
+ * refuses (nothing configured; two or more configured pairs; a single pair whose issuer is
+ * not the one the resource server trusts) — AND as the way to keep a brand pinned after a
+ * cut-over, which the next section explains is not optional.
  *
  * <p>{@link org.springframework.core.env.MutablePropertySources#addLast addLast} is the
  * second line of defence, covering sources attached AFTER post-processors run (a test's
@@ -53,13 +55,31 @@ import org.springframework.core.env.MapPropertySource;
  * Spring Boot's own config-data processor, so {@code application.yml} (and the
  * {@code ${APP_TENANCY_ISSUERS:}} placeholder in it) is already resolvable.
  *
- * <h2>It is silent-safe</h2>
+ * <h2>Not arming is silent-safe ONLY BEFORE THE CUT-OVER</h2>
  *
- * <p>When the resolution does not arm, this contributes NOTHING: the parameter stays
- * undefined, 007's precondition fails, {@code onFail="CONTINUE"} leaves the changeset
- * PENDING, and no row is touched. The reason is logged at INFO either way, so a boot log
- * always states which domain the wiki considers itself launched on and whether the
- * re-stamp armed.
+ * <p>When the resolution does not arm, this contributes NOTHING. On a database where the
+ * re-stamp has never run that is exactly inert: the parameter stays undefined, 007's
+ * precondition fails, {@code onFail="CONTINUE"} leaves the changeset PENDING, and no row
+ * is touched.
+ *
+ * <p>ON A DATABASE WHERE THE CUT-OVER HAS ALREADY RUN IT IS NOT INERT — IT REFUSES
+ * STARTUP. Liquibase substitutes the parameter into the {@code <sql>} BEFORE it checksums
+ * the changeset, so the checksum recorded by the armed run embeds the brand. A later boot
+ * that publishes no parameter (or a different one) computes a different checksum and dies
+ * in {@code ValidationFailedException: ... 007-restamp-default-domain-to-brand ... was:
+ * 9:&lt;a&gt; but is now: 9:&lt;b&gt;}. That is the same guard that makes a brand RENAME
+ * fail loudly, and it is deliberate — but it means that once the cut-over has run,
+ * {@code APP_TENANCY_ISSUERS} is load-bearing for STARTUP, not just for scoping: emptying
+ * it, or extending it to a second pair, crashloops the pod with an error that names a
+ * checksum rather than the configuration change. The remedy is to pin the brand
+ * explicitly and permanently after the cut-over
+ * ({@code SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand>}), which the
+ * override path above honours on every subsequent boot regardless of what the derivation
+ * says. Measured by {@code DerivedTargetRerunTest}; spelled out in the README and in
+ * 007's own header, and named in the not-armed log line below.
+ *
+ * <p>The reason is logged at INFO either way, so a boot log always states which domain the
+ * wiki considers itself launched on and whether the re-stamp armed.
  */
 public class RestampTargetEnvironmentPostProcessor
         implements EnvironmentPostProcessor, Ordered {
@@ -122,14 +142,20 @@ public class RestampTargetEnvironmentPostProcessor
         if (!resolution.armsRestamp()) {
             log.info("wiki-bff 007: launch domain resolves to '" + resolution.domain()
                     + "' (" + resolution.source() + ") and the cut-over re-stamp is NOT armed — "
-                    + resolution.reason() + ". The changeset stays PENDING and no row is touched.");
+                    + resolution.reason() + ". On a database where the cut-over has NOT run this"
+                    + " is inert: the changeset stays PENDING and no row is touched. On one where"
+                    + " it HAS run, Liquibase validation will REFUSE this startup, because the"
+                    + " recorded checksum embeds the brand that was substituted into the SQL — set"
+                    + " SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN to that brand to"
+                    + " boot, and keep it set.");
             return;
         }
 
         // A BLANK value is not an override, and it must not be allowed to act as one. An
-        // empty SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN — the same shape the
-        // platform manifest already uses for APP_TENANCY_ISSUERS — outranks a lowest-
-        // precedence contribution, so publishing at addLast would leave the blank in force,
+        // empty SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN — the shape a
+        // templated Deployment env entry produces when its source value is unset —
+        // outranks a lowest-precedence contribution, so publishing at addLast would
+        // leave the blank in force,
         // 007's regex would reject it, and the cut-over would be SILENTLY inert with the
         // brand correctly configured. So the blank case, and only it, is contributed at the
         // top instead. Measured by RestampTargetEnvironmentPostProcessorTest.

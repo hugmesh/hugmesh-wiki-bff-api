@@ -14,7 +14,7 @@ import net.hugmesh.commons.security.DomainRegistry;
  *
  * <p>PR #20 landed {@code 007-restamp-default-domain.xml} gated on an operator-typed
  * Liquibase parameter, {@code wiki.restamp.target.domain}. The operator's answer on
- * hugmesh-generator#347 was: <em>"hugmesh is teh default but should always take what
+ * hugmesh-generator#347 was: <em>"hugmesh is the default but should always take what
  * domain the wiki is launched on"</em> — i.e. stop asking for a brand, derive it. This
  * class is that derivation, and {@link RestampTargetEnvironmentPostProcessor} publishes
  * its result as the Liquibase parameter at boot.
@@ -24,28 +24,37 @@ import net.hugmesh.commons.security.DomainRegistry;
  * <p>The launch domain is read out of {@link DomainRegistry#knownDomains()} by
  * CONSTRUCTING A REGISTRY, not by re-parsing {@code app.tenancy.issuers} here. That is
  * deliberate: the registry is what {@code PrincipalDomain.forScope} consults on every
- * request, so a value obtained this way is BY CONSTRUCTION the string the running
- * application will put in {@code WHERE domain = ?}. A hand-rolled second parser could
+ * request, so a value obtained this way is the string the running application will put in
+ * {@code WHERE domain = ?} FOR A TOKEN FROM THAT ISSUER. A hand-rolled second parser could
  * drift from it (trailing-slash trimming, {@code sanitize()}'s lower-casing and
  * {@code [^a-z0-9-] -> '-'} replacement, malformed-pair skipping), and a drifted target
  * would re-stamp every row into a domain no principal can ever resolve — the exact
  * silent-data-loss failure 007 exists to prevent.
  *
+ * <p>Deriving the same STRING is necessary but NOT sufficient: the token also has to be
+ * one the resource server accepts. See the arming rule below.
+ *
  * <h2>The safety rule: only arm when the runtime will agree</h2>
  *
  * <p>Deriving a VALUE is not the same as it being SAFE to re-stamp to. The re-stamp is
- * correct only when the domain it writes is the domain the running application resolves.
- * So {@link Resolution#armsRestamp()} is true in exactly one shape — {@code
- * app.tenancy.issuers} naming exactly ONE brand that is not the legacy {@code "default"}
- * sentinel:
+ * correct only when the domain it writes is the domain the running application resolves
+ * FOR EVERY PRINCIPAL IT WILL ADMIT. So {@link Resolution#armsRestamp()} is true in
+ * exactly one shape — {@code app.tenancy.issuers} holding exactly ONE pair, whose issuer
+ * is the issuer this resource server trusts, naming a brand that is not the legacy
+ * {@code "default"} sentinel:
  *
  * <pre>
- *  app.tenancy.issuers        | runtime domainOf() | launch domain | arms re-stamp
- *  ───────────────────────────┼────────────────────┼───────────────┼──────────────
- *  unset / no valid pair      | "default"          | {@value #FALLBACK_DOMAIN}    | NO  (see below)
- *  one pair "https://i=acme"  | "acme"             | "acme"        | YES — cut-over
- *  two or more pairs          | per-issuer brand   | ambiguous     | NO  (see below)
+ *  app.tenancy.issuers                  | runtime domainOf() | launch domain | arms
+ *  ─────────────────────────────────────┼────────────────────┼───────────────┼──────
+ *  unset / no valid pair                | "default"          | {@value #FALLBACK_DOMAIN}       | NO
+ *  ONE pair, issuer == issuer-uri       | "acme"             | "acme"        | YES
+ *  ONE pair, issuer != issuer-uri       | null (fail-closed) | {@value #FALLBACK_DOMAIN}       | NO
+ *  TWO OR MORE pairs (any brand count)  | per-issuer brand   | {@value #FALLBACK_DOMAIN}       | NO
  * </pre>
+ *
+ * <p>NOTE the last two rows key on the number of configured PAIRS, not on the number of
+ * distinct brands. Two pairs naming the same brand are two pairs, and they do not arm —
+ * see below.
  *
  * <h2>Why the unconfigured row does NOT arm, even though it has a target</h2>
  *
@@ -65,21 +74,51 @@ import net.hugmesh.commons.security.DomainRegistry;
  * strand those five services' data to rename this one's. See issue #19 for the full
  * reasoning.
  *
- * <h2>Why two-or-more brands does NOT arm</h2>
+ * <h2>Why a single pair must name the issuer the resource server actually trusts</h2>
  *
- * <p>There is no single "the domain the wiki is launched on" to take. Worse, 007's
- * predicate is {@code WHERE domain = 'default'}, and on an already-multi-brand cluster
- * {@code 'default'} rows can also be minted by a SUPERADMIN write (their scope is null and
- * the repositories coerce it to {@link DomainRegistry#DEFAULT_DOMAIN}), so an auto-armed
- * run would sweep SUPERADMIN-authored rows into whichever brand happened to sort first.
- * The operator keeps the explicit {@code wiki.restamp.target.domain} override for this
- * case; it still wins over anything derived here.
+ * <p>MEASURED, and the reason this check exists at all. With exactly one pair
+ * {@link DomainRegistry#isMultiIssuer()} is {@code false}, so {@code SecurityConfig}
+ * keeps the single-issuer {@code o.jwt(issuer-uri)} decoder and the ONLY tokens that
+ * validate are those carrying
+ * {@code iss = spring.security.oauth2.resourceserver.jwt.issuer-uri}. If the configured
+ * pair names a DIFFERENT issuer — the compose stack's published
+ * {@code http://localhost:8000} versus the internal {@code http://casdoor:8000} is
+ * exactly this confusion, see {@code application.yml} — then {@code domainOf(issuer-uri)}
+ * is {@code null} and every principal resolves the {@code __deny__} sentinel while the
+ * brand string still parses cleanly out of the mapping. Arming there re-stamps the whole
+ * wiki into a domain nobody can reach. So the derivation additionally requires
+ * {@code brand.equals(registry.domainOf(issuerUri))}: in single-pair mode
+ * {@code domainOf(issuerUri)} IS what every admitted principal resolves.
+ *
+ * <h2>Why two or more PAIRS does not arm</h2>
+ *
+ * <p>Two or more distinct brands: there is no single "the domain the wiki is launched on"
+ * to take. Two or more pairs naming ONE brand: every principal does resolve that brand,
+ * but {@link DomainRegistry#isMultiIssuer()} is already {@code true}, which is the
+ * "already multi-brand cluster" shape 007's header refuses to auto-arm on — {@code
+ * 'default'} rows there can be SUPERADMIN-authored (their scope is null and the
+ * repositories coerce it to {@link DomainRegistry#DEFAULT_DOMAIN}) rather than legacy
+ * pre-cut-over rows, and sweeping those is a decision, not a migration. Refusing both
+ * keeps the rule the operator-facing documents state — <em>exactly one configured
+ * pair</em> — literally true, and the explicit {@code wiki.restamp.target.domain}
+ * override remains the escape hatch for a deliberate multi-issuer cut-over.
+ *
+ * <h2>What this guard does NOT cover (issue #22)</h2>
+ *
+ * <p>The SUPERADMIN-authored-{@code 'default'}-row hazard above is a property of the
+ * DATA; every rule here is a property of the CONFIGURATION, and the data outlives the
+ * shape. Narrowing {@code app.tenancy.issuers} from two-or-more pairs down to one
+ * (decommissioning a brand) leaves 007 still PENDING — it never ran under the refused
+ * shape — so the next boot arms and sweeps whatever {@code 'default'} rows that cluster
+ * accumulated. Nothing in this class can see them. The pre-flight in the 007 header
+ * ({@code SELECT domain, count(*) FROM wiki_page GROUP BY domain}) is the gate for that
+ * transition, and issue #22 carries the options for making the precondition data-aware.
  */
 public final class WikiLaunchDomain {
 
     /**
      * The platform's default brand name — the domain the wiki is launched on when the
-     * issuer mapping names none. Per the operator: "hugmesh is teh default".
+     * issuer mapping names none. Per the operator: "hugmesh is the default".
      *
      * <p>NOTE this is the FALLBACK ANSWER, not an armed re-stamp target; see the class
      * javadoc for why the unconfigured case reports it but does not act on it.
@@ -94,6 +133,20 @@ public final class WikiLaunchDomain {
      * ceiling, which is the width of every {@code domain} column.
      */
     private static final Pattern SPELLABLE = Pattern.compile("^[a-z0-9-]{1,64}$");
+
+    /**
+     * Whether {@code domain} can be stored in a {@code domain} column at all — the same
+     * {@code ^[a-z0-9-]{1,64}$} test the arming rule applies, exposed so the brand
+     * CATALOGUE can narrow its offered list by the identical rule instead of keeping a
+     * second copy of the regex. {@code DomainRegistry.sanitize()} guarantees the alphabet
+     * but not the 64-character ceiling, so a registry value CAN fail this.
+     *
+     * @param domain the candidate brand name; may be {@code null}
+     * @return {@code true} iff {@code domain} matches {@code ^[a-z0-9-]{1,64}$}
+     */
+    public static boolean isSpellableAsDomainColumn(final String domain) {
+        return domain != null && SPELLABLE.matcher(domain).matches();
+    }
 
     private WikiLaunchDomain() {
         // Static-only holder for the derivation; never instantiated.
@@ -130,9 +183,10 @@ public final class WikiLaunchDomain {
     public static Resolution resolve(final String issuerUri, final String issuersCsv) {
         // Construct the REAL registry so the derived string is byte-identical to what
         // PrincipalDomain.forScope will produce for this configuration.
-        return resolve(new DomainRegistry(
+        return resolveFrom(new DomainRegistry(
                 issuerUri == null ? "" : issuerUri,
-                issuersCsv == null ? "" : issuersCsv));
+                issuersCsv == null ? "" : issuersCsv),
+                issuerUri);
     }
 
     /**
@@ -145,11 +199,29 @@ public final class WikiLaunchDomain {
      * {@code /bff/wiki/superadmin/brands} catalogue) calls THIS overload and both answers
      * come from one registry instance.
      *
-     * @param registry the registry to read {@link DomainRegistry#knownDomains()} from;
-     *                 must not be {@code null}
+     * <p>It is named {@code resolveFrom} rather than being a second {@code resolve}
+     * overload for a boring but real reason: {@code resolve(null, null)} would otherwise be
+     * ambiguous between {@code (String, String)} and {@code (DomainRegistry, String)}, and
+     * a test that passes both arguments null is exactly the "nothing configured" case this
+     * class most needs to be able to express.
+     *
+     * <p>{@code issuerUri} is taken separately rather than read back off the registry
+     * because {@link DomainRegistry} does not expose its back-compat single issuer. It is
+     * REQUIRED, not optional: without it the single-pair shape cannot be told apart from
+     * the mismatched-issuer shape that arms a re-stamp no principal can reach. There is
+     * deliberately no overload that omits it — a caller that could not supply it would get
+     * a different {@code armsRestamp} answer from the one the boot-time post-processor
+     * computed, and two derivations that disagree is the failure this class exists to
+     * avoid.
+     *
+     * @param registry  the registry to read {@link DomainRegistry#knownDomains()} from;
+     *                  must not be {@code null}
+     * @param issuerUri {@code spring.security.oauth2.resourceserver.jwt.issuer-uri}, the
+     *                  single issuer this resource server trusts when the registry is not
+     *                  in multi-issuer mode; may be {@code null}
      * @return the resolution; never {@code null}
      */
-    public static Resolution resolve(final DomainRegistry registry) {
+    public static Resolution resolveFrom(final DomainRegistry registry, final String issuerUri) {
         Set<String> brands = registry.knownDomains();
 
         if (brands.isEmpty()) {
@@ -161,6 +233,20 @@ public final class WikiLaunchDomain {
         if (brands.size() > 1) {
             return fallback("app.tenancy.issuers names " + brands.size() + " brands " + brands
                     + ", so there is no single domain this wiki is launched on; supply"
+                    + " wiki.restamp.target.domain explicitly if a cut-over is intended");
+        }
+        if (registry.isMultiIssuer()) {
+            // ONE brand but MORE THAN ONE pair. Every principal does resolve that brand, so
+            // the value is not ambiguous — but isMultiIssuer() is already true, which is the
+            // already-multi-brand cluster 007 refuses to auto-arm on: its 'default' rows can
+            // be SUPERADMIN-authored rather than legacy. Refuse, and keep the documented
+            // "exactly one configured pair" rule literally true.
+            return fallback("app.tenancy.issuers configures " + registry.trustedIssuers().size()
+                    + " issuer pairs " + registry.trustedIssuers() + " that all name the single"
+                    + " brand '" + brands.iterator().next() + "'. Every principal does resolve"
+                    + " that brand, but this is already a multi-issuer cluster, where a"
+                    + " domain='default' row can be a SUPERADMIN write rather than a legacy"
+                    + " row; sweeping those is a decision, not a migration. Supply"
                     + " wiki.restamp.target.domain explicitly if a cut-over is intended");
         }
 
@@ -177,9 +263,28 @@ public final class WikiLaunchDomain {
             return fallback("the brand derived from app.tenancy.issuers ('" + only + "') is not"
                     + " spellable as ^[a-z0-9-]{1,64}$, so it cannot be a domain-column value");
         }
+        String trustedBrand = registry.domainOf(issuerUri);
+        if (!only.equals(trustedBrand)) {
+            // MEASURED hazard, not a theoretical one. One pair leaves isMultiIssuer() false,
+            // so SecurityConfig keeps the single-issuer o.jwt(issuer-uri) decoder: the only
+            // tokens that validate carry iss = issuer-uri. If the pair names a different
+            // issuer, domainOf(issuer-uri) is null, PrincipalDomain hands back the __deny__
+            // sentinel for every principal, and arming would re-stamp the whole wiki into a
+            // domain nobody can reach.
+            return fallback("app.tenancy.issuers names exactly one brand ('" + only + "'), but"
+                    + " its issuer is not the one this resource server trusts"
+                    + " (spring.security.oauth2.resourceserver.jwt.issuer-uri="
+                    + (issuerUri == null || issuerUri.isBlank() ? "<unset>" : issuerUri)
+                    + " resolves to " + (trustedBrand == null ? "no brand" : "'" + trustedBrand + "'")
+                    + "). With one pair the single-issuer decoder admits only that issuer's"
+                    + " tokens, so re-stamping to '" + only + "' would move every row behind a"
+                    + " predicate no principal resolves. Point the pair at the trusted issuer,"
+                    + " or supply wiki.restamp.target.domain explicitly");
+        }
         return new Resolution(only, Source.ISSUER_MAPPING, true,
-                "app.tenancy.issuers names exactly one brand ('" + only + "'), which is the"
-                        + " domain every principal of this deployment resolves");
+                "app.tenancy.issuers names exactly one brand ('" + only + "') on the issuer this"
+                        + " resource server trusts, which is the domain every principal of this"
+                        + " deployment resolves");
     }
 
     private static Resolution fallback(final String reason) {
