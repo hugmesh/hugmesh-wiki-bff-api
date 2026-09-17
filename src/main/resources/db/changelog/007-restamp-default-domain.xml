@@ -75,22 +75,30 @@
       WRITE the rows it moved.
 
       `PrincipalDomain.forScope` returns null for a SUPERADMIN (the cross-domain read
-      bypass), and every WRITE path coerces that null to `DomainRegistry.DEFAULT_DOMAIN`
-      — WikiPageRepository:104 (create), :132 (updateBySlug), :151 (publishBySlug),
-      :164 (deleteBySlugAndDomain), WikiAttachmentRepository:93/117,
-      WikiAuditLogRepository:60, WikiAccessRepository:70. So a SUPERADMIN write is
+      bypass), and the REMAINING WRITE paths coerce that null to
+      `DomainRegistry.DEFAULT_DOMAIN` — WikiPageRepository:104 (create), :132
+      (updateBySlug), :151 (publishBySlug), WikiAttachmentRepository:93/117,
+      WikiAuditLogRepository:60, WikiAccessRepository:70. So such a SUPERADMIN write is
       literally `... WHERE domain = 'default'`, and after this migration there are no
       'default' rows left for it to match. Concretely, on a migrated page a SUPERADMIN's
-      update answers a nonsense 409, their publish a 404, and their delete answers 204
-      having deleted nothing.
+      update answers a nonsense 409 and their publish a 404.
+
+      DELETE NO LONGER BELONGS ON THAT LIST (issue #15, fixed). `WikiService.delete`
+      now resolves the page in the caller's scope and deletes BY THE RESOLVED ROW'S ID
+      (WikiPageRepository:170 `deleteById` — no domain predicate at all), so a
+      SUPERADMIN delete reaches a migrated row correctly, a delete that matches nothing
+      is a 404 rather than a 204, and it can never remove `default`'s same-slug page.
+      Attachments go with the page in the same statement via the `wiki_attachment` FK
+      ON DELETE CASCADE (002), so nothing is destroyed ahead of a delete that fails.
 
       This is the SAME cost the rejected sentinel would have carried; it is not a reason
       to prefer either. The brand's own scoped ADMIN/EDITOR principals DO regain full
       write access to every migrated row, which is what makes the brand the right target.
-      The residual SUPERADMIN gap is issue #15 (SUPERADMIN writes must use the null
-      cross-domain scope instead of coercing to DEFAULT_DOMAIN); #15 must land before a
-      SUPERADMIN can administer a post-cut-over deployment. That caveat applies to the
-      MIGRATED rows just as much as to the rows this migration deliberately leaves alone.
+      The residual SUPERADMIN gap is now create/update/publish only (and the attachment,
+      audit and access writes above): those must use the null cross-domain scope instead
+      of coercing to DEFAULT_DOMAIN before a SUPERADMIN can fully administer a
+      post-cut-over deployment. That caveat applies to the MIGRATED rows just as much as
+      to the rows this migration deliberately leaves alone.
 
       ── WHAT THIS TOUCHES (exhaustive) ──────────────────────────────────────────
       Only the `domain` column, only where it equals the literal 'default', in the four

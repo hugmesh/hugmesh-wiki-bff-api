@@ -223,6 +223,17 @@ class WikiControllerTest {
     }
 
     @Test
+    void deletePage_serviceNotFound_is404_notFoldedInto204() {
+        // Issue #15: the service signals "matched nothing" as a 404; the controller must
+        // surface it rather than answer 204 for every completion.
+        when(wiki.delete(eq("home"), any()))
+                .thenReturn(Mono.error(ApiException.notFound("wiki page not found: home")));
+        asSuperadmin().delete().uri("/bff/wiki/admin/pages/home").exchange()
+                .expectStatus().isNotFound()
+                .expectBody().jsonPath("$.error").isEqualTo("wiki page not found: home");
+    }
+
+    @Test
     void deletePage_forbiddenForModWiki() {
         asModWiki().delete().uri("/bff/wiki/admin/pages/home").exchange()
                 .expectStatus().isForbidden();

@@ -28,8 +28,8 @@ import net.hugmesh.commons.web.ApiException;
  *   <li><b>Author tracking</b> — {@code author_subject} is set from the JWT subject (the
  *       owner track), never the request body, so a caller cannot author under another
  *       subject.</li>
- *   <li><b>Audit</b> — every create/update/publish is recorded to {@code wiki_audit_log}
- *       in the actor's brand.</li>
+ *   <li><b>Audit</b> — every create/update/publish/delete is recorded to
+ *       {@code wiki_audit_log} in the brand the page lives in.</li>
  * </ul>
  */
 @Service
@@ -39,16 +39,13 @@ public class WikiService {
     private final WikiAuditLogRepository audit;
     private final MarkdownRenderer markdown;
     private final PrincipalDomain principalDomain;
-    private final WikiAttachmentRepository attachments;
 
     public WikiService(WikiPageRepository pages, WikiAuditLogRepository audit,
-                       MarkdownRenderer markdown, PrincipalDomain principalDomain,
-                       WikiAttachmentRepository attachments) {
+                       MarkdownRenderer markdown, PrincipalDomain principalDomain) {
         this.pages = pages;
         this.audit = audit;
         this.markdown = markdown;
         this.principalDomain = principalDomain;
-        this.attachments = attachments;
     }
 
     /**
@@ -190,24 +187,44 @@ public class WikiService {
     }
 
     /**
-     * Delete a page by slug in the caller's domain. Cascades to its attachments (the DB
-     * FK ON DELETE CASCADE handles the physical delete; this method also deletes explicitly
-     * for the audit trail). Audits wiki.page.delete. A missing slug is a 404.
+     * Delete a page by slug. The page is resolved in the caller's scope ({@link #scopeOf}:
+     * a brand for a scoped ADMIN, the cross-brand bypass for SUPERADMIN) and then deleted
+     * <b>by the id of that resolved row</b> — never by slug+domain — so the delete can only
+     * ever remove the row the resolve found. Issue #15: a SUPERADMIN's {@code null} scope
+     * used to be coerced to {@code default} on the delete, which either matched nothing and
+     * still answered 204, or destroyed {@code default}'s same-slug page instead — after the
+     * target's attachments had already been deleted.
      *
-     * @param slug the URL-stable page key within the caller's brand
+     * <p>Attachments go with the page in the SAME statement via the {@code wiki_attachment}
+     * FK {@code ON DELETE CASCADE} (changelog 002); nothing is deleted ahead of the page, so
+     * a delete that matches nothing destroys nothing. A zero-row delete (the resolved row
+     * vanished concurrently) is a 404, not a silent success. The audit row is stamped with
+     * the brand the page actually lived in ({@code page.domain()}), never the caller's scope
+     * (which is {@code null} — coerced to {@code default} — for a SUPERADMIN).
+     *
+     * <pre>
+     * findBySlug(slug, scope) ─ empty ──→ 404 page not found
+     *                          └─ page ──→ deleteById(page.id())
+     *                                      ├─ 0 rows ──→ 404 (vanished; nothing audited)
+     *                                      └─ 1 row ───→ audit.record(..., page.domain())
+     * </pre>
+     *
+     * @param slug the URL-stable page key (within the caller's brand; any brand for SUPERADMIN)
      * @param auth the caller's Spring Security principal
-     * @return a {@link Mono} that completes empty on success
-     * @throws ApiException 404 when the slug is not found in the caller's brand
+     * @return a {@link Mono} that completes empty once exactly one row was removed
+     * @throws ApiException 404 when the slug is not found in the caller's scope, or when the
+     *                      resolved row was gone by the time the delete ran
      */
     public Mono<Void> delete(String slug, Authentication auth) {
         String domain = scopeOf(auth);
         String actor = subject(auth);
         return pages.findBySlug(slug, domain)
                 .switchIfEmpty(Mono.error(ApiException.notFound("wiki page not found: " + slug)))
-                .flatMap(page -> attachments.deleteByPageId(page.id())
-                        .then(pages.deleteBySlugAndDomain(slug, domain))
-                        .then(audit.record(actor, "wiki.page.delete", slug,
-                                "deleted page and its attachments", domain)))
+                .flatMap(page -> pages.deleteById(page.id())
+                        .filter(deleted -> deleted > 0)
+                        .switchIfEmpty(Mono.error(ApiException.notFound("wiki page not found: " + slug)))
+                        .flatMap(deleted -> audit.record(actor, "wiki.page.delete", slug,
+                                "deleted page and its attachments", page.domain())))
                 .then();
     }
 

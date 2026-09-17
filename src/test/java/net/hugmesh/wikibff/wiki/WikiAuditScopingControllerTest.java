@@ -29,6 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -100,8 +101,8 @@ class WikiAuditScopingControllerTest {
     static class RealServiceConfig {
         @Bean
         WikiService wikiService(WikiPageRepository pages, WikiAuditLogRepository audit,
-                                WikiAttachmentRepository attachments, PrincipalDomain principalDomain) {
-            return new WikiService(pages, audit, new MarkdownRenderer(), principalDomain, attachments);
+                                PrincipalDomain principalDomain) {
+            return new WikiService(pages, audit, new MarkdownRenderer(), principalDomain);
         }
     }
 
@@ -123,7 +124,6 @@ class WikiAuditScopingControllerTest {
     // the captured `domain` arg is the value the REAL WikiService.scopeOf produced.
     @MockitoBean WikiPageRepository pages;
     @MockitoBean WikiAuditLogRepository auditRepo;
-    @MockitoBean WikiAttachmentRepository attachments;
     @MockitoBean WikiAccessGuard accessGuard;
     @MockitoBean ReactiveJwtDecoder jwtDecoder;
 
@@ -164,8 +164,22 @@ class WikiAuditScopingControllerTest {
     }
 
     private static WikiPage pageRow(String domain, String slug) {
-        return new WikiPage("id-" + slug, domain, slug, "Title", "# md", "<h1>md</h1>",
+        return pageRow(domain, slug, "id-" + slug);
+    }
+
+    /** A row with an EXPLICIT id — the delete tests pin the delete to the resolved row's id,
+     *  so two same-slug rows in different brands must be distinguishable by id. */
+    private static WikiPage pageRow(String domain, String slug, String id) {
+        return new WikiPage(id, domain, slug, "Title", "# md", "<h1>md</h1>",
                 "author-1", 1L, Instant.now(), Instant.now(), false, null);
+    }
+
+    /** Capture the {@code domain} the delete audit row was stamped with — produced by the
+     *  REAL {@code WikiService.delete} from the RESOLVED page, not from the caller's scope. */
+    private String capturedDeleteAuditDomain() {
+        org.mockito.ArgumentCaptor<String> captor = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(auditRepo).record(any(), eq("wiki.page.delete"), any(), any(), captor.capture());
+        return captor.getValue();
     }
 
     // ── SUPERADMIN ⇒ cross-domain (null) bypass, derived by the REAL service ──
@@ -363,25 +377,72 @@ class WikiAuditScopingControllerTest {
     }
 
     @Test
-    void delete_brandXAdmin_repoDeleteScopedToBrandX_brandYRowInvisible() {
+    void delete_brandXAdmin_resolvesInBrandX_deletesThatRowsId_brandYRowUnreachable() {
         // delete() first findBySlug(slug, brandx) — a brand-Y page must be invisible here, so
         // a brand-X admin can never delete another brand's page. We model the brandx lookup
-        // returning the page (so delete proceeds) and prove the scoped lookup is brandx.
-        when(pages.findBySlug(eq("home"), eq("brandx"))).thenReturn(Mono.just(pageRow("brandx", "home")));
-        when(pages.findBySlug(eq("home"), eq("brandy"))).thenReturn(Mono.just(pageRow("brandy", "home")));
-        when(attachments.deleteByPageId(any())).thenReturn(Mono.just(0L));
-        when(pages.deleteBySlugAndDomain(eq("home"), any())).thenReturn(Mono.just(1L));
+        // returning the brand-X row (so delete proceeds) and prove BOTH that the scoped lookup
+        // is brandx AND that the delete is pinned to the id that lookup returned.
+        when(pages.findBySlug(eq("home"), eq("brandx"))).thenReturn(Mono.just(pageRow("brandx", "home", "id-x-home")));
+        when(pages.findBySlug(eq("home"), eq("brandy"))).thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home")));
+        when(pages.deleteById("id-x-home")).thenReturn(Mono.just(1L));
         when(auditRepo.record(any(), any(), any(), any(), any()))
                 .thenReturn(Mono.just(auditRow("brandx", "wiki.page.delete", "home")));
 
         as(BRANDX_ISS, "admin").delete().uri("/bff/wiki/admin/pages/home")
                 .exchange().expectStatus().isNoContent();
 
-        // MUTATION-RESISTANT: every delete step is brand-X scoped; the brand-Y lookup is
-        // never consulted (so a brand-Y page can never be deleted by a brand-X admin). A
-        // leaked scope would hit findBySlug(home, brandy) and FAIL the never-verify.
+        // MUTATION-RESISTANT: the resolve is brand-X scoped and the brand-Y lookup is never
+        // consulted; the delete is by the RESOLVED row's id, so brand-Y's same-slug row (a
+        // different id) is structurally unreachable — there is no domain left to leak.
         verify(pages).findBySlug("home", "brandx");
         verify(pages, never()).findBySlug("home", "brandy");
-        verify(pages).deleteBySlugAndDomain("home", "brandx");
+        verify(pages).deleteById("id-x-home");
+        verify(pages, never()).deleteById("id-y-home");
+        assertThat(capturedDeleteAuditDomain())
+                .as("the delete audit lands in the brand the page lived in")
+                .isEqualTo("brandx");
+    }
+
+    // ── SUPERADMIN delete (issue #15): resolve cross-brand, delete THAT row, audit in ITS brand ──
+
+    @Test
+    void delete_superadmin_pageInNonDefaultBrand_deletesResolvedRowById_auditsInPageBrand() {
+        // Issue #15: a SUPERADMIN's scope is null (cross-brand resolve) and the old delete
+        // coerced that null to "default" — DELETE ... WHERE slug=? AND domain='default' —
+        // which never matched brand-Y's row (204, page left behind, attachments already gone)
+        // or, worse, removed default's same-slug page. The fix deletes by the resolved id.
+        when(pages.findBySlug(eq("runbook"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "runbook", "id-y-runbook")));
+        when(pages.deleteById("id-y-runbook")).thenReturn(Mono.just(1L));
+        when(auditRepo.record(any(), any(), any(), any(), any()))
+                .thenReturn(Mono.just(auditRow("brandy", "wiki.page.delete", "runbook")));
+
+        as(BRANDX_ISS, "superadmin").delete().uri("/bff/wiki/admin/pages/runbook")
+                .exchange().expectStatus().isNoContent();
+
+        // MUTATION-RESISTANT: the resolve used the null bypass (derived by the REAL service
+        // from the super-role), the delete is pinned to the id that resolve returned, and
+        // the audit domain is the PAGE's brand — not null/"default", not the issuer's brandx.
+        verify(pages).findBySlug("runbook", null);
+        verify(pages).deleteById("id-y-runbook");
+        assertThat(capturedDeleteAuditDomain())
+                .as("the delete audit is stamped with the brand the page actually lived in")
+                .isEqualTo("brandy");
+    }
+
+    @Test
+    void delete_zeroRowsMatched_is404_neverAudited() {
+        // The resolved row vanished before the DELETE ran (a concurrent delete). The old code
+        // discarded the count and answered 204 regardless; now "matched nothing" is a 404 and
+        // nothing is written to the audit trail for a delete that did not happen.
+        when(pages.findBySlug(eq("gone"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "gone", "id-y-gone")));
+        when(pages.deleteById("id-y-gone")).thenReturn(Mono.just(0L));
+
+        as(BRANDX_ISS, "superadmin").delete().uri("/bff/wiki/admin/pages/gone")
+                .exchange().expectStatus().isNotFound();
+
+        verify(pages).deleteById("id-y-gone");
+        verify(auditRepo, never()).record(any(), any(), any(), any(), any());
     }
 }
