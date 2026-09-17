@@ -192,6 +192,35 @@ per-principal read overrides:
   the read guard queried the victim's own brand, so the ban silently never took effect.
 - **list-active / history** are `WIKI_MANAGE` operations (SUPERADMIN only), served under
   `/bff/wiki/superadmin/access`.
+- **The target-brand catalogue** (`GET /bff/wiki/superadmin/brands`, `WIKI_MANAGE`) serves
+  what the console needs to offer a real PICKER for that `targetDomain` instead of free
+  text (hugmesh-wiki-ui#3). It answers three separate questions and they are not
+  interchangeable:
+  - `brands` — every value this bff will **accept** as a `targetDomain`. Built by running
+    `DomainRegistry.knownDomains()` through `DomainRegistry.isKnownDomain`, the same
+    predicate `WikiAccessService.writeDomain` validates with, so a listed brand is
+    accepted by construction and the always-rejected sentinels (`default`, blank) cannot
+    appear. Sorted, so the rendered order does not drift with an env-var edit.
+  - `launchDomain` — the domain this wiki is **launched on**, from the same
+    `WikiLaunchDomain` derivation the 007 re-stamp target uses (so the console and the
+    migration can never disagree), falling back to `hugmesh`. It is **not necessarily a
+    member of `brands`**: with 2+ brands there is no single launch domain and the fallback
+    is reported, so a caller must check membership before preselecting it.
+  - `targetDomainHonoured` — whether `targetDomain` is consulted **at all**.
+    `writeDomain` reads it only when `DomainRegistry.isMultiIssuer()`, i.e. **two or more**
+    configured issuer pairs. Below that a SUPERADMIN write is stamped `default` whatever
+    the body said.
+  With **exactly one** configured pair (`app.tenancy.issuers=https://id=hugmesh`) those
+  last two combine into a live hazard: users resolve `hugmesh`, but a SUPERADMIN grant or
+  ban is stamped `default`, so `WikiAccessGuard` — which reads back
+  `activeFor(subject, "hugmesh")` — never matches it. That is the same
+  silently-ineffective ban #39 closed for 2+ brands, still open at exactly 1, and issue
+  #19's launch-domain derivation makes the single-pair mapping the first-class
+  single-brand launch shape. It is filed for a decision as **issue #21**. This endpoint
+  does not change `writeDomain` (that would turn a silent no-op into a 400 for existing
+  deployments); it makes the combination
+  *detectable* — `brands` non-empty while `targetDomainHonoured` is false — so the console
+  can warn instead of rendering a control the server discards.
 - Rows transition from `active` to `revoked` but are **never hard-deleted** — the full
   history is retained for audit. A re-grant after revocation inserts a new row.
 - Precedence in `WikiAccessGuard`: an active ban or timeout **denies even a role-holder or
@@ -242,6 +271,7 @@ flowchart TD
 | GET | `/bff/wiki/superadmin/access` | WIKI_MANAGE (list active) |
 | GET | `/bff/wiki/superadmin/access/{userSubject}/history` | WIKI_MANAGE |
 | GET | `/bff/wiki/superadmin/audit?limit=` | WIKI_MANAGE (bounded newest-first read, `limit` clamped to `[1, 1000]`, default 200) → `WikiDto.AuditList` |
+| GET | `/bff/wiki/superadmin/brands` | WIKI_MANAGE (the target-brand catalogue) → `WikiAccessDto.Brands` |
 
 The audit read returns a **named** `AuditList` / `AuditEntry` schema (`{"actions": [...]}`,
 newest first). It used to return a bare `Map<String, Object>`, which springdoc rendered as an
@@ -281,7 +311,7 @@ its own tokens, and any token with an unknown `iss` claim is rejected with **401
 > ```
 > Leave the variable unset for a single-brand deployment.
 
-### Cut-over: existing rows must be re-stamped BEFORE `APP_TENANCY_ISSUERS` is set
+### Cut-over: set `APP_TENANCY_ISSUERS` and redeploy — the re-stamp derives its own target
 
 Turning multi-brand on is **not** a config-only change on a cluster that already holds
 wiki data. With `APP_TENANCY_ISSUERS` unset, `DomainRegistry` seeds the back-compat
@@ -297,29 +327,114 @@ activates. The pages, their attachments, the audit trail and — most sharply �
 row is stranded at `default` is silently un-banned. Later writes stamp *new* rows
 `"<brand>"`, so an un-migrated rollback leaves split-brain data.
 
-Liquibase changeset **`007-restamp-default-domain.xml`** is the migration for this. It is
-inert until armed, and it re-stamps `domain='default'` to the brand you are about to
-configure across all four domain-bearing tables (`wiki_page`, `wiki_attachment`,
-`wiki_audit_log`, `wiki_access`) in one transaction.
+Liquibase changeset **`007-restamp-default-domain.xml`** is the migration for this. It
+re-stamps `domain='default'` to the brand you are configuring, across all four
+domain-bearing tables (`wiki_page`, `wiki_attachment`, `wiki_audit_log`, `wiki_access`) in
+one transaction — and since issue #19 it **works out the brand for itself**. You do not
+type it.
 
 ```sh
-# 1. arm and run the migration FIRST (brand must equal the brand half of the pair below,
-#    and must match ^[a-z0-9-]{1,64}$ — DomainRegistry lower-cases and rewrites the rest)
-spring.liquibase.parameters.wiki.restamp.target.domain=brand-a
-
-# 2. only then set the registry
+# The whole cut-over. One step.
 APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
 ```
 
-The Spring property form above is the one covered by a test
-(`RestampParameterBindingBootTest` boots the app with it set and asserts the changeset is
-recorded as executed rather than skipped). If you arm it from a Kubernetes env var instead
-(`SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN`), confirm in the boot log that the
-`... NOT armed` precondition message is **absent** before trusting the run — an un-armed run
-is silent by design.
+`RestampTargetEnvironmentPostProcessor` reads that mapping through a real `DomainRegistry`
+before Liquibase binds its parameters, and publishes the brand as
+`wiki.restamp.target.domain`. Because Liquibase runs during context refresh, the re-stamp
+completes **before the application serves its first request** under the new brand, in the
+same boot that configures it. There is no window between the two and nothing to sequence.
 
-Between the two steps the brand's rows are unreachable, so do both in one maintenance
-window.
+> **This replaces the old two-step procedure.** Earlier revisions of this README told you
+> to run the migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an
+> un-armed run publishes no target and migrates nothing.
+
+It arms **only** when the mapping holds exactly one pair, **and that pair names the issuer
+this resource server trusts** (`CASDOOR_ISSUER_URI`):
+
+| `APP_TENANCY_ISSUERS`                           | every principal resolves | re-stamp target | arms? |
+| ----------------------------------------------- | ------------------------ | --------------- | ----- |
+| unset / no valid pair                           | `default`                | none            | no    |
+| one pair `https://i=brand-a`, `i` == issuer-uri | `brand-a`                | `brand-a`       | **yes** |
+| one pair `https://j=brand-a`, `j` != issuer-uri | *nothing* (fail-closed)  | none            | no    |
+| two or more **pairs** (any number of brands)    | per-issuer brand         | none            | no    |
+
+The last two rows count **pairs**, not distinct brands. Two pairs naming the same brand are
+two pairs, and they do not arm.
+
+**A single pair on the wrong issuer does not arm, and this is the sharp one.** One pair
+leaves `isMultiIssuer()` false, so `SecurityConfig` keeps the single-issuer
+`o.jwt(issuer-uri)` decoder: the only tokens that validate are those carrying
+`iss = CASDOOR_ISSUER_URI`. Point the pair at a *different* URL for the same Casdoor — the
+compose stack's published `http://localhost:8000` versus the in-network
+`http://casdoor:8000` is exactly this trap — and the brand parses perfectly while
+`domainOf(issuer-uri)` is `null`, so every principal resolves the `__deny__` sentinel.
+Arming there would re-stamp the whole wiki into a domain nobody can reach. The derivation
+therefore requires `brand == domainOf(CASDOOR_ISSUER_URI)` before it arms.
+
+**Unset does not arm, and that is deliberate.** With nothing configured every principal
+already resolves `default` — the stamp the rows already carry — so there is nothing to
+re-stamp. The launch domain is reported as `hugmesh` (`WikiLaunchDomain.FALLBACK_DOMAIN`,
+per the operator: *"hugmesh is the default"*), but it is **not** written to the rows:
+doing that while the runtime still resolves `default` would strand the entire wiki behind
+a predicate nobody matches. `hugmesh` becomes the live launch domain the moment you name
+it — `APP_TENANCY_ISSUERS=https://casdoor.hugmesh.example.com=hugmesh` — and then it arms
+like any other brand. It is deliberately *not* made live by changing
+`DomainRegistry.DEFAULT_DOMAIN`, which admin-bff, federation-api, user-bff, owncast-bff
+and forum-bff all share and none of which has a re-stamp migration of its own.
+
+**Two or more pairs does not arm** because — with two or more *brands* — there is no
+single launch domain, and because on an already-multi-brand cluster `default` rows can also
+be written by a SUPERADMIN (see the SUPERADMIN note below), so an auto-armed run would
+sweep those into whichever brand sorted first. Two pairs naming *one* brand are refused for
+the second reason alone: the value is unambiguous, but `isMultiIssuer()` is already true, so
+this is that same already-multi-brand cluster. Use the manual override there.
+
+> **What the config-shape rule cannot see** (hugmesh-wiki-bff-api#22). The
+> SUPERADMIN-authored-`default`-row hazard is a property of the **data**; every rule above
+> is a property of the **configuration**, and the data outlives the shape. If you run two
+> brands, let a SUPERADMIN author content, then *narrow* `APP_TENANCY_ISSUERS` back to one
+> pair, the derivation arms — 007 is still `PENDING`, it never ran under the refused shape —
+> and sweeps those rows into the surviving brand. Run the pre-flight below before any
+> narrowing, not just before a first cut-over.
+
+**Manual override still works** and is the escape hatch for both refused shapes — set
+`spring.liquibase.parameters.wiki.restamp.target.domain` (or the
+`SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` env var) and it wins over the
+derivation. The value must still match `^[a-z0-9-]{1,64}$` and must not be `default`.
+
+Whichever path you use, the boot log states the outcome in one line — `launch domain
+derived as '<brand>' ... Arming the cut-over re-stamp`, or `... is NOT armed — <reason>`.
+Read it: an un-armed run is otherwise silent by design.
+
+**Renaming the brand after the cut-over refuses the next startup, on purpose.** Editing
+`APP_TENANCY_ISSUERS` from `=brand-a` to `=brand-b` changes the derived parameter, which
+is substituted into the changeset's SQL before Liquibase checksums it, so the redeploy
+dies with `ValidationFailedException: ... 1 changesets check sum ...
+007-restamp-default-domain-to-brand ... was: 9:<a> but is now: 9:<b>`. Nothing is
+migrated. That is the safe outcome — the rows sit at `brand-a` while every principal now
+resolves `brand-b`, and a silent skip would hide an emptied wiki until users reported it.
+A post-cut-over rename is a real data migration this changeset does not perform; resolve
+it deliberately (re-stamp `brand-a` -> `brand-b`, then `changelogSync`), never by
+relaxing the checksum. Redeploying *unchanged* is a safe no-op.
+
+**After the cut-over, `APP_TENANCY_ISSUERS` is load-bearing for STARTUP — pin the brand.**
+The same checksum guard that makes a rename fail loudly also fires when the derivation
+stops arming at all. **Un-setting** the variable ("turn multi-brand back off", a reverted
+manifest, ArgoCD `selfHeal` undoing a manual `kubectl set env`) and **adding a second
+brand** — the documented multi-brand growth path — both publish *no* parameter, so the
+recorded checksum no longer matches and the pod crashloops on
+`ValidationFailedException: ... 007-restamp-default-domain-to-brand ... check sum ...`.
+Nothing is migrated and nothing is lost, but the error names a checksum, not the config
+change, so it does not look like what it is. Measured in
+`DerivedTargetRerunTest.unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned`.
+
+> **So make the cut-over two env vars, not one.** Once the armed boot has succeeded, set
+> `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand>` **permanently** and leave
+> it there. The explicit override wins on every later boot regardless of what the derivation
+> says, so `APP_TENANCY_ISSUERS` goes back to being an ordinary scoping knob. If you are
+> already crashlooping, that one variable — set to the brand the *forward run* used, which
+> the cut-over boot log records verbatim — is the fix; `liquibase rollback-count 1
+> -Dwiki.restamp.target.domain=<brand>` followed by `changelogSync` is the undo.
 
 **Before you arm it, check the cluster really is single-brand.** If a row already stamped
 `<brand>` shares a unique key with a `default` row being moved onto it, the forward UPDATE
@@ -338,9 +453,15 @@ psql -c "SELECT domain, count(*) FROM wiki_access GROUP BY domain;"
 
 Pass the same `wiki.restamp.target.domain` parameter to any rollback — the rollback
 statements are re-parsed from the changelog, so without it they predicate on the literal,
-un-substituted placeholder and match nothing. Roll back **before** setting
-`APP_TENANCY_ISSUERS`; afterwards the inverse re-stamp drags post-cut-over writes back to
-`default` too.
+un-substituted placeholder and match nothing. **The derivation does not help here:**
+`RestampTargetEnvironmentPostProcessor` is a Spring Boot `EnvironmentPostProcessor`, so it
+runs only when the *application* boots. A rollback driven from the Liquibase CLI or Maven
+plugin must pass the brand explicitly, and it must be the brand the forward run actually
+used — the cut-over boot log records it verbatim; `databasechangelog` does not. The
+rollback is **exact** only while nothing has been written under the new brand: run it
+immediately after the cut-over boot, before the application starts serving, or accept that
+the inverse re-stamp drags post-cut-over writes back to `default` too. (There is nothing to
+roll back *before* the cut-over boot — the changeset has not run.)
 
 ```sh
 # preferred: immediately after the armed run the re-stamp is the last changeset executed,

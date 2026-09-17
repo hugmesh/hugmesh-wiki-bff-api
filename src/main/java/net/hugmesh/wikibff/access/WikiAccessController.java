@@ -7,6 +7,7 @@ import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.validation.annotation.Validated;
@@ -18,6 +19,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
+import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.wikibff.wiki.WikiController;
 
 import java.util.Map;
@@ -36,6 +38,10 @@ import java.util.Map;
  *       their own brand (server-derived domain); SUPERADMIN is cross-domain.</li>
  *   <li>list-all / history (manage-all) — {@link WikiController#WIKI_MANAGE} (SUPERADMIN),
  *       mounted under {@code /bff/wiki/superadmin/access} so the path gate is SUPERADMIN.</li>
+ *   <li>the BRAND CATALOGUE ({@code /bff/wiki/superadmin/brands}) — {@link
+ *       WikiController#WIKI_MANAGE} (SUPERADMIN), the config-derived answer to "which brands
+ *       may a cross-brand write name?" that lets the console offer a picker instead of free
+ *       text. Config only: no principal, no scope, no DB. See {@link WikiBrandCatalog}.</li>
  * </ul>
  * Every write is DOMAIN-SCOPED in the service; {@code state=revoked} rows are RETAINED
  * (audit), never hard-deleted.
@@ -50,13 +56,25 @@ public class WikiAccessController {
 
     private final WikiAccessService access;
 
+    private final WikiBrandCatalog brands;
+
     /**
-     * Constructs the controller with its sole dependency.
+     * Constructs the controller with its dependencies.
      *
-     * @param access the service that owns all {@code wiki_access} read/write logic
+     * @param access   the service that owns all {@code wiki_access} read/write logic
+     * @param registry  the issuer-to-brand registry, from which the target-brand catalogue is
+     *                  derived; the same bean {@code SecurityConfig} imports and the write path
+     *                  validates against
+     * @param issuerUri the single issuer this resource server trusts, needed so the
+     *                  catalogue's {@code launchDomain} is the SAME derivation the boot-time
+     *                  007 re-stamp target used (issue #19) rather than a second opinion
      */
-    public WikiAccessController(WikiAccessService access) {
+    public WikiAccessController(
+            WikiAccessService access,
+            DomainRegistry registry,
+            @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri:}") String issuerUri) {
         this.access = access;
+        this.brands = new WikiBrandCatalog(registry, issuerUri);
     }
 
     // ── grant / timeout / ban / restore (WIKI_WRITE) ───────────────────
@@ -252,5 +270,47 @@ public class WikiAccessController {
     public Mono<WikiAccessDto.AccessList> history(@PathVariable String userSubject, Authentication auth) {
         return access.historyFor(userSubject, auth).map(WikiAccessDto.Access::of)
                 .collectList().map(WikiAccessDto.AccessList::new);
+    }
+
+    @Operation(
+            operationId = "wikiAccessBrands",
+            summary = "The BRAND CATALOGUE for the target-brand picker: every value this bff "
+                    + "accepts as targetDomain, the domain the wiki is launched on, and whether "
+                    + "targetDomain is consulted at all. SUPERADMIN.",
+            description = "Serves the authoritative brand set the SUPERADMIN cross-brand writes "
+                    + "are validated against, so the console can offer a PICKER instead of free "
+                    + "text. Backed by the same DomainRegistry the write path validates against: "
+                    + "<ul>"
+                    + "<li><code>brands</code> — DomainRegistry.knownDomains() filtered through "
+                    + "DomainRegistry.isKnownDomain, i.e. exactly the values a grant/timeout/ban "
+                    + "may name in targetDomain. Sorted. Empty on a single-issuer deployment.</li>"
+                    + "<li><code>launchDomain</code> — the domain this wiki is launched on, from "
+                    + "the same derivation the 007 re-stamp target uses; falls back to "
+                    + "<code>hugmesh</code>. NOT necessarily a member of <code>brands</code>: on a "
+                    + "2+-brand deployment there is no single launch domain, so check membership "
+                    + "before preselecting it.</li>"
+                    + "<li><code>targetDomainHonoured</code> — false when fewer than two issuers "
+                    + "are configured, where WikiAccessService.writeDomain ignores the field and "
+                    + "stamps <code>default</code> regardless of the body.</li>"
+                    + "</ul>"
+                    + "No new disclosure: a SUPERADMIN is cross-domain by definition and can "
+                    + "already read every brand's access rows and audit trail."
+                    + "<table>"
+                    + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>All brands</td></tr>"
+                    + "<tr><td>ADMIN / MOD / USER</td><td>No</td><td>—</td></tr>"
+                    + "</table>")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "The brand catalogue. brands may be "
+                    + "an empty list (single-issuer back-compat, where targetDomain is ignored)."),
+            @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
+            @ApiResponse(responseCode = "403", description = "Caller does not hold SUPERADMIN role.", content = @Content)
+    })
+    @PreAuthorize(WikiController.WIKI_MANAGE)
+    @GetMapping("/superadmin/brands")
+    public Mono<WikiAccessDto.Brands> brands() {
+        // Config-derived and immutable after startup — no principal, no DB, no scope: the
+        // SUPERADMIN gate above is the whole of the access control.
+        return Mono.just(brands.snapshot());
     }
 }
