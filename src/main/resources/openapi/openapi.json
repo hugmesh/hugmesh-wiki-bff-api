@@ -78,7 +78,7 @@
       "delete" : {
         "tags" : [ "Wiki" ],
         "summary" : "Delete a wiki page by slug (cascades to its attachments; audited). ADMIN/SUPERADMIN.",
-        "description" : "Delete a wiki page by slug in the caller's brand. Cascades to its attachments. Audited. ADMIN/SUPERADMIN only.",
+        "description" : "Delete a wiki page by slug, resolved in the caller's scope (the caller's brand; any brand for a SUPERADMIN) and deleted by that row's id, so no other brand's same-slug page can be touched. Cascades to its attachments. Audited in the brand the page lived in. ADMIN/SUPERADMIN only.",
         "operationId" : "wikiDeletePage",
         "parameters" : [ {
           "name" : "slug",
@@ -90,7 +90,7 @@
         } ],
         "responses" : {
           "204" : {
-            "description" : "Page (and its attachments) deleted."
+            "description" : "Exactly one page row (and its attachments) was deleted."
           },
           "401" : {
             "description" : "No valid JWT presented."
@@ -99,7 +99,7 @@
             "description" : "Caller is not ADMIN or SUPERADMIN."
           },
           "404" : {
-            "description" : "Slug not found in the caller's brand."
+            "description" : "Slug not found in the caller's scope, or the resolved page was already gone when the delete ran (nothing was removed)."
           },
           "500" : {
             "description" : "Unexpected server error."

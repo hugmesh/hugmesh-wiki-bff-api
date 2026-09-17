@@ -259,23 +259,32 @@ public class WikiController {
     }
 
     /**
-     * Delete a wiki page by slug in the caller's brand. Cascades to its attachments.
-     * Audited. ADMIN/SUPERADMIN only.
+     * Delete a wiki page by slug. The page is resolved in the caller's scope (the caller's
+     * brand; any brand for a SUPERADMIN) and deleted by that row's id, so the delete can only
+     * ever remove the row the resolve found; its attachments go with it via the
+     * {@code wiki_attachment} FK {@code ON DELETE CASCADE}. Audited in the brand the page
+     * lived in. ADMIN/SUPERADMIN only. A 204 therefore means exactly one page row was
+     * removed -- issue #15: it used to be returned unconditionally, including when the
+     * delete matched nothing.
      *
-     * @param slug the URL-stable page key within the caller's brand
+     * @param slug the URL-stable page key within the caller's brand (any brand for SUPERADMIN)
      * @param auth the caller's Spring Security principal (injected by the framework)
-     * @return a {@link Mono} emitting a 204 No Content response on success
+     * @return a {@link Mono} emitting a 204 No Content response once the page row was removed
      */
     @Operation(
             operationId = "wikiDeletePage",
             summary = "Delete a wiki page by slug (cascades to its attachments; audited). ADMIN/SUPERADMIN.",
-            description = "Delete a wiki page by slug in the caller's brand. Cascades to its "
-                    + "attachments. Audited. ADMIN/SUPERADMIN only.")
+            description = "Delete a wiki page by slug, resolved in the caller's scope (the "
+                    + "caller's brand; any brand for a SUPERADMIN) and deleted by that row's "
+                    + "id, so no other brand's same-slug page can be touched. Cascades to its "
+                    + "attachments. Audited in the brand the page lived in. ADMIN/SUPERADMIN only.")
     @ApiResponses({
-            @ApiResponse(responseCode = "204", description = "Page (and its attachments) deleted."),
+            @ApiResponse(responseCode = "204", description = "Exactly one page row (and its attachments) was deleted."),
             @ApiResponse(responseCode = "401", description = "No valid JWT presented.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller is not ADMIN or SUPERADMIN.", content = @Content),
-            @ApiResponse(responseCode = "404", description = "Slug not found in the caller's brand.", content = @Content),
+            @ApiResponse(responseCode = "404", description = "Slug not found in the caller's scope, "
+                    + "or the resolved page was already gone when the delete ran (nothing was removed).",
+                    content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected server error.", content = @Content)
     })
     @PreAuthorize(WIKI_WRITE)
