@@ -1,0 +1,9 @@
+# Spring Boot 4 loads EnvironmentPostProcessor implementations from THIS file, under THIS
+# key — not from META-INF/spring/*.imports (that mechanism is auto-configuration's) and
+# not under the org.springframework.boot.env.* FQN that still exists as a deprecated
+# alias. Registering it the wrong way is SILENT: the class compiles, ships, and simply
+# never runs, and because an un-armed 007 is indistinguishable from a correctly inert one
+# (onFail="CONTINUE"), nothing in a boot log would say so. DerivedRestampTargetBootTest is
+# the assertion that catches it.
+org.springframework.boot.EnvironmentPostProcessor=\
+net.hugmesh.wikibff.config.RestampTargetEnvironmentPostProcessor

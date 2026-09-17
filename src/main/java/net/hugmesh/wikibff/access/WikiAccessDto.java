@@ -75,6 +75,59 @@ public final class WikiAccessDto {
         }
     }
 
+    /**
+     * {@code GET /bff/wiki/superadmin/brands} — the BRAND CATALOGUE the console's target-brand
+     * picker is built from (hugmesh-wiki-bff-api#12).
+     *
+     * <p>The three fields answer the three different questions a picker has to get right, and
+     * they are NOT interchangeable:
+     *
+     * <ul>
+     *   <li>{@code brands} — every value this bff will ACCEPT as a
+     *       {@link GrantOrBan#targetDomain()}. Built by filtering
+     *       {@link net.hugmesh.commons.security.DomainRegistry#knownDomains()} through the very
+     *       predicate the write path validates with
+     *       ({@code DomainRegistry.isKnownDomain}), so a listed brand is accepted BY
+     *       CONSTRUCTION and the sentinels that always 400 ({@code default}, blank) cannot
+     *       appear. Sorted, so the rendered order is stable.</li>
+     *   <li>{@code launchDomain} — the domain THIS WIKI IS LAUNCHED ON, from the same
+     *       {@link net.hugmesh.wikibff.config.WikiLaunchDomain} derivation the 007 re-stamp
+     *       target uses, so the console and the migration can never disagree about it. Never
+     *       blank: it falls back to {@code hugmesh} exactly as that derivation does. It is NOT
+     *       necessarily a member of {@code brands} — on a 2+-brand deployment there is no
+     *       single launch domain and the fallback is reported instead — so a caller that wants
+     *       to preselect it MUST check membership first.</li>
+     *   <li>{@code targetDomainHonoured} — whether {@code targetDomain} is consulted AT ALL.
+     *       {@code WikiAccessService.writeDomain} reads the field whenever this deployment
+     *       configures at least one real brand: with 2+ a SUPERADMIN must name one, and with
+     *       exactly one the field may be omitted (that brand is stamped) but naming a
+     *       different brand is a {@code 400}. It is false ONLY on a back-compat single-issuer
+     *       deployment, where every principal genuinely is {@code default}, the field is inert
+     *       and {@code brands} is empty — so false now always means "nothing to pick", never
+     *       "a real choice the server will discard". See {@link WikiBrandCatalog}.</li>
+     * </ul>
+     *
+     * @param brands               the accepted {@code targetDomain} values, sorted; never {@code null},
+     *                             possibly empty (single-issuer back-compat)
+     * @param launchDomain         the domain this wiki is launched on; never {@code null} or blank
+     * @param targetDomainHonoured whether the bff consults a request's {@code targetDomain}
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record Brands(List<String> brands, String launchDomain, boolean targetDomainHonoured) {
+        /**
+         * Defensive copy on the way IN — a record's canonical constructor otherwise stores the
+         * CALLER's list by reference (EI_EXPOSE_REP2), as {@link AccessList} documents.
+         */
+        public Brands {
+            brands = List.copyOf(brands);
+        }
+
+        @Override
+        public List<String> brands() {
+            return List.copyOf(brands);
+        }
+    }
+
     // ── request bodies ─────────────────────────────────────────────────
 
     /**
@@ -84,6 +137,13 @@ public final class WikiAccessDto {
      * always issuer-derived and this field is ignored): a SUPERADMIN bans a brand-X user by
      * passing {@code targetDomain="brandx"} so the row lands in (and the read guard matches)
      * the victim's brand instead of the inert {@code default} domain.
+     *
+     * <p>How the field is read depends on how many brands the deployment configures, and the
+     * full table is on {@code WikiAccessService.writeDomain}. In short: with TWO OR MORE
+     * configured brands a SUPERADMIN must name one or take a {@code 400}; with EXACTLY ONE
+     * the field may be omitted (that brand is stamped) and naming any other brand is a
+     * {@code 400}; with NO brand configured at all the field is inert and the write is
+     * stamped {@code default} as it always was.
      *
      * @param userSubject  Casdoor subject of the principal to grant or ban; required,
      *                     max 400 characters
@@ -105,7 +165,8 @@ public final class WikiAccessDto {
      * {@code POST .../access/timeout} — a {@code banned} override with a FUTURE expiry.
      * {@code ttlSeconds} drives the auto-restore instant; it must be positive.
      * {@code targetDomain} is the VICTIM's brand for a SUPERADMIN cross-brand timeout (same
-     * contract as {@link GrantOrBan#targetDomain()}; ignored for a scoped ADMIN).
+     * contract as {@link GrantOrBan#targetDomain()}, including the single-configured-brand
+     * rules; ignored for a scoped ADMIN).
      *
      * @param userSubject  Casdoor subject of the principal to timeout; required,
      *                     max 400 characters
