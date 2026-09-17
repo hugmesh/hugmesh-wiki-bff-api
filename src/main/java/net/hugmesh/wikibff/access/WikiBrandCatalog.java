@@ -61,11 +61,16 @@ import net.hugmesh.wikibff.security.PrincipalDomain;
  * "nothing to pick" signal; the old hazard combination (brands non-empty while not honoured)
  * can no longer occur.
  *
- * <p>STILL PAIRED, one repo away: hugmesh-wiki-ui carries a regenerated copy of this repo's
- * {@code openapi.json} and five {@code BrandMode}s derived from these three fields. Its
- * single-configured-pair mode must stop warning that the server discards the field. Nothing
- * fails if they drift — the console simply keeps warning about a control that now works. That
- * hand-off is recorded on #21.
+ * <p>ONE REPO AWAY, and MEASURED rather than assumed (a skeptic pass corrected an earlier
+ * claim here that said the opposite): hugmesh-wiki-ui derives five {@code BrandMode}s from
+ * these three fields, but it derives them AT RUNTIME — {@code applyCatalog} branches on
+ * {@code targetDomainHonoured} FIRST and reads {@code brands.length} only to tell the two
+ * INERT shapes apart. So the moment this bff reports {@code honoured=true} the shipped console
+ * renders its live {@code picker} with NO code change and stops warning on its own; there is
+ * no console edit paired to this class. The only artefact that does go stale is the copy of
+ * this repo's {@code openapi.json} that repo regenerates its typed client from, and the
+ * decision-26 delta there is description text only. That hand-off is recorded on #21 and on
+ * hugmesh-wiki-ui#3.
  *
  * <h2>Deliberately NOT a {@code @Component}</h2>
  *

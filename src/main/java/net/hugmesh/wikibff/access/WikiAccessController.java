@@ -292,7 +292,10 @@ public class WikiAccessController {
                     + "<ul>"
                     + "<li><code>brands</code> — DomainRegistry.knownDomains() filtered through "
                     + "DomainRegistry.isKnownDomain, i.e. exactly the values a grant/timeout/ban "
-                    + "may name in targetDomain. Sorted. Empty on a single-issuer deployment.</li>"
+                    + "may name in targetDomain. Sorted. Empty ONLY on a back-compat deployment "
+                    + "that configures no brand at all (app.tenancy.issuers unset); a deployment "
+                    + "with exactly ONE configured pair is still single-issuer to the decoder but "
+                    + "DOES list that one brand.</li>"
                     + "<li><code>launchDomain</code> — the domain this wiki is launched on, from "
                     + "the same derivation the 007 re-stamp target uses; falls back to "
                     + "<code>hugmesh</code>. NOT necessarily a member of <code>brands</code>: on a "
@@ -315,7 +318,8 @@ public class WikiAccessController {
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "The brand catalogue. brands may be "
-                    + "an empty list (single-issuer back-compat, where targetDomain is ignored)."),
+                    + "an empty list — only on a back-compat deployment that configures no brand "
+                    + "at all, which is also the only shape where targetDomain is ignored."),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold SUPERADMIN role.", content = @Content)
     })

@@ -215,7 +215,16 @@ per-principal read overrides:
   > brand now gets a `400`. (3) Rows already written before the upgrade are still stamped
   > `default` and are still inert; re-issue those grants/bans, or run the 007 re-stamp
   > (which moves `wiki_access.domain` too) as part of the cut-over. A SUPERADMIN's
-  > `revoke`, `list-active` and `history` are unscoped and can already see the old rows.
+  > `revoke`, `list-active` and `history` are unscoped and can already see the old rows —
+  > but note that `revoke` clears **one row per call**: unscoped it resolves through
+  > `findFirstByUserSubjectAndAccessTypeAndStateOrderByCreatedAtDescIdAsc`, i.e. the NEWEST
+  > active row of that type in any brand. So where a stale `default` row and a new
+  > brand-stamped row coexist, the first call clears the new one and a second call is needed
+  > for the stale one. They do coexist rather than collide: `uq_wiki_access_active`
+  > (changelog 004) is a partial unique on `(domain, user_subject, access_type)` with
+  > `domain` IN the key, so the post-upgrade insert cannot trip a constraint on the old row.
+  > The leftover `default` row is inert for a branded principal, so this is tidy-up, not a
+  > correctness risk.
 - **list-active / history** are `WIKI_MANAGE` operations (SUPERADMIN only), served under
   `/bff/wiki/superadmin/access`.
 - **The target-brand catalogue** (`GET /bff/wiki/superadmin/brands`, `WIKI_MANAGE`) serves
@@ -724,7 +733,9 @@ for transparency rather than deleted from the history:
   configured pair (a real brand) from the back-compat `{issuer -> "default"}` seed (not one)
   — so the write is stamped with the brand, a mismatched `targetDomain` is a 400, and the
   back-compat case is byte-for-byte unchanged. Pinned by
-  `WikiAccessSingleBrandStampTest` (24 cases, both directions).
+  `WikiAccessSingleBrandStampTest` (27 cases, both directions) and by
+  `WikiBrandCatalogTest`'s agreement case, which drives the REAL `writeDomain` rather than
+  restating the catalogue's own expression.
 
 ## Roadmap / out of repo
 
