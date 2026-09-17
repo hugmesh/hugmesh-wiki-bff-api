@@ -75,6 +75,58 @@ public final class WikiAccessDto {
         }
     }
 
+    /**
+     * {@code GET /bff/wiki/superadmin/brands} — the BRAND CATALOGUE the console's target-brand
+     * picker is built from (hugmesh-wiki-bff-api#12).
+     *
+     * <p>The three fields answer the three different questions a picker has to get right, and
+     * they are NOT interchangeable:
+     *
+     * <ul>
+     *   <li>{@code brands} — every value this bff will ACCEPT as a
+     *       {@link GrantOrBan#targetDomain()}. Built by filtering
+     *       {@link net.hugmesh.commons.security.DomainRegistry#knownDomains()} through the very
+     *       predicate the write path validates with
+     *       ({@code DomainRegistry.isKnownDomain}), so a listed brand is accepted BY
+     *       CONSTRUCTION and the sentinels that always 400 ({@code default}, blank) cannot
+     *       appear. Sorted, so the rendered order is stable.</li>
+     *   <li>{@code launchDomain} — the domain THIS WIKI IS LAUNCHED ON, from the same
+     *       {@link net.hugmesh.wikibff.config.WikiLaunchDomain} derivation the 007 re-stamp
+     *       target uses, so the console and the migration can never disagree about it. Never
+     *       blank: it falls back to {@code hugmesh} exactly as that derivation does. It is NOT
+     *       necessarily a member of {@code brands} — on a 2+-brand deployment there is no
+     *       single launch domain and the fallback is reported instead — so a caller that wants
+     *       to preselect it MUST check membership first.</li>
+     *   <li>{@code targetDomainHonoured} — whether {@code targetDomain} is consulted AT ALL.
+     *       {@code WikiAccessService.writeDomain} reads the field only when
+     *       {@code DomainRegistry.isMultiIssuer()} (2+ configured pairs); below that a
+     *       SUPERADMIN write is stamped {@code default} whatever the body said. A picker that
+     *       ignored this would offer a choice the server discards. See the note on
+     *       {@link WikiBrandCatalog} for the one configuration where that is a hazard rather
+     *       than merely inert.</li>
+     * </ul>
+     *
+     * @param brands               the accepted {@code targetDomain} values, sorted; never {@code null},
+     *                             possibly empty (single-issuer back-compat)
+     * @param launchDomain         the domain this wiki is launched on; never {@code null} or blank
+     * @param targetDomainHonoured whether the bff consults a request's {@code targetDomain}
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record Brands(List<String> brands, String launchDomain, boolean targetDomainHonoured) {
+        /**
+         * Defensive copy on the way IN — a record's canonical constructor otherwise stores the
+         * CALLER's list by reference (EI_EXPOSE_REP2), as {@link AccessList} documents.
+         */
+        public Brands {
+            brands = List.copyOf(brands);
+        }
+
+        @Override
+        public List<String> brands() {
+            return List.copyOf(brands);
+        }
+    }
+
     // ── request bodies ─────────────────────────────────────────────────
 
     /**
