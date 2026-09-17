@@ -350,9 +350,15 @@ class WikiBrandCatalogTest {
 
         @Test
         void aPairTooLongToStoreInTheDomainColumn() {
-            // The varchar(64) narrowing must move BOTH sides together: drop it from
-            // soleConfiguredBrand alone and the flag says "honoured" while writeDomain still
-            // stamps default.
+            // MEASURED, and the honest limit of an agreement test: dropping the varchar(64)
+            // narrowing does NOT redden this class, because both sides read the SAME
+            // soleConfiguredBrand and so stay in agreement while being wrong together (the
+            // catalogue starts offering the over-long brand AND writeDomain starts taking the
+            // one-pair branch for it). That mutation is caught where the damage actually is —
+            // WikiAccessSingleBrandStampTest.aBrandTooLongToStore_isNotASoleBrand and
+            // .aBrandTooLongForTheDomainColumn_isNotTreatedAsTheBrand both fail, verified by
+            // running the mutation. This case is here to pin the AGREEMENT on that shape, not
+            // to claim coverage it does not have.
             assertFlagMatchesBehaviour(ANY_ISSUER, ANY_ISSUER + "=" + "a".repeat(65));
         }
     }
