@@ -5,6 +5,7 @@ import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.security.oauth2.jwt.Jwt;
 
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.wikibff.security.PrincipalDomain;
@@ -115,8 +116,8 @@ class WikiBrandCatalogTest {
     }
 
     @Nested
-    @DisplayName("exactly ONE configured pair — the shape where the field is inert but the "
-            + "brand is real (the hazard the catalogue exists to expose)")
+    @DisplayName("exactly ONE configured pair — a real brand, and (since issue #21 / decision "
+            + "26) a LIVE picker: the write path stamps it and rejects any other")
     class SingleConfiguredPair {
 
         private static final String ISSUER = "https://id.hugmesh.example";
@@ -129,19 +130,32 @@ class WikiBrandCatalogTest {
         }
 
         @Test
-        void reportsThatTargetDomainIsNOTHonoured() {
-            // DomainRegistry.isMultiIssuer() is size() > 1, so writeDomain never reads the body
-            // field here: a SUPERADMIN write is stamped 'default' whatever the picker chose.
-            // This is the single-brand launch shape issue #19's derivation makes first-class,
-            // so the console must be able to see it and warn instead of offering a live control.
-            assertThat(snapshot(ISSUER, CSV).targetDomainHonoured()).isFalse();
+        void reportsThatTargetDomainIS_Honoured() {
+            // WAS false, and that was the hazard this class was built to expose: writeDomain
+            // read the field only when isMultiIssuer() (size() > 1), so a SUPERADMIN write here
+            // was stamped 'default' whatever the picker chose. Issue #21 / operator decision 26
+            // closed that: one configured pair IS the brand, it is stamped, and naming a
+            // different one is a 400 — so the console must render a LIVE control, not a warning.
+            assertThat(snapshot(ISSUER, CSV).targetDomainHonoured()).isTrue();
         }
 
         @Test
-        void theBrandsListAndTheHonouredFlagDisagree_whichIsTheDetectableSignal() {
+        void theHazardCombinationCanNoLongerOccur_brandsNonEmptyWhileNotHonoured() {
+            // The detectable signal the console warned on was (brands non-empty AND NOT
+            // honoured). Pinned as unreachable on this shape so the warning cannot come back.
             WikiAccessDto.Brands b = snapshot(ISSUER, CSV);
             assertThat(b.brands()).isNotEmpty();
-            assertThat(b.targetDomainHonoured()).isFalse();
+            assertThat(b.targetDomainHonoured()).isTrue();
+        }
+
+        @Test
+        void theHonouredFlagAgreesWithTheWritePathsOwnPredicate() {
+            // Never a second opinion: the flag must be exactly "writeDomain will read the
+            // field", which is isMultiIssuer() OR a sole configured brand.
+            DomainRegistry registry = new DomainRegistry(ISSUER, CSV);
+            assertThat(snapshot(ISSUER, CSV).targetDomainHonoured())
+                    .isEqualTo(registry.isMultiIssuer()
+                            || PrincipalDomain.soleConfiguredBrand(registry) != null);
         }
 
         @Test
@@ -171,6 +185,32 @@ class WikiBrandCatalogTest {
                     .as("falls back rather than naming a brand no admitted principal resolves")
                     .isEqualTo("hugmesh");
             assertThat(b.brands()).doesNotContain(b.launchDomain());
+        }
+
+        @Test
+        void onThatSameMisconfiguration_theWritePathStampsTheBrand_whichChangesNothing() {
+            // DELIBERATE divergence, documented rather than silently inherited: the launch-domain
+            // derivation refuses to name 'acme' here because the TRUSTED issuer does not resolve
+            // it, but PrincipalDomain.soleConfiguredBrand reads the registry alone and does name
+            // it — so a SUPERADMIN write is now stamped 'acme' where it used to be stamped
+            // 'default'. That is NEUTRAL, not a regression: in this configuration every
+            // non-SUPERADMIN principal resolves the fail-closed '__deny__' sentinel, so NO stamp
+            // — 'acme', 'default' or anything else — can ever be matched by WikiAccessGuard. The
+            // deployment is already broken for its users; the field the row carries is the least
+            // of it. Threading issuer-uri into the write path to make the two agree would be new
+            // surface for a case that is inert either way; it is recorded on #21 instead.
+            DomainRegistry registry = new DomainRegistry("https://id.hugmesh.example",
+                    "https://casdoor.internal:8000=acme");
+            assertThat(PrincipalDomain.soleConfiguredBrand(registry)).isEqualTo("acme");
+            assertThat(new PrincipalDomain(registry).forScope(
+                    Jwt.withTokenValue("t").header("alg", "none")
+                            .issuedAt(java.time.Instant.now())
+                            .expiresAt(java.time.Instant.now().plusSeconds(3600))
+                            .subject("u").claim("iss", "https://id.hugmesh.example")
+                            .issuer("https://id.hugmesh.example")
+                            .claim("roles", java.util.List.of("user")).build()))
+                    .as("every admitted principal fails closed, so no stamp can match")
+                    .isEqualTo("__deny__");
         }
     }
 

@@ -98,12 +98,13 @@ public final class WikiAccessDto {
      *       single launch domain and the fallback is reported instead — so a caller that wants
      *       to preselect it MUST check membership first.</li>
      *   <li>{@code targetDomainHonoured} — whether {@code targetDomain} is consulted AT ALL.
-     *       {@code WikiAccessService.writeDomain} reads the field only when
-     *       {@code DomainRegistry.isMultiIssuer()} (2+ configured pairs); below that a
-     *       SUPERADMIN write is stamped {@code default} whatever the body said. A picker that
-     *       ignored this would offer a choice the server discards. See the note on
-     *       {@link WikiBrandCatalog} for the one configuration where that is a hazard rather
-     *       than merely inert.</li>
+     *       {@code WikiAccessService.writeDomain} reads the field whenever this deployment
+     *       configures at least one real brand: with 2+ a SUPERADMIN must name one, and with
+     *       exactly one the field may be omitted (that brand is stamped) but naming a
+     *       different brand is a {@code 400}. It is false ONLY on a back-compat single-issuer
+     *       deployment, where every principal genuinely is {@code default}, the field is inert
+     *       and {@code brands} is empty — so false now always means "nothing to pick", never
+     *       "a real choice the server will discard". See {@link WikiBrandCatalog}.</li>
      * </ul>
      *
      * @param brands               the accepted {@code targetDomain} values, sorted; never {@code null},

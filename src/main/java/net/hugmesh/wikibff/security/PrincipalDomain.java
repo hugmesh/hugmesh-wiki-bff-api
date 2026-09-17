@@ -5,6 +5,7 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.stereotype.Component;
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.commons.security.Roles;
+import net.hugmesh.wikibff.config.WikiLaunchDomain;
 
 import java.util.Set;
 
@@ -155,10 +156,24 @@ public class PrincipalDomain {
      * and is deliberately left untouched here.
      *
      * @return the single configured non-{@code default} brand, or {@code null} when the
-     *         registry holds none, holds only the back-compat {@code default} seed, or holds
-     *         two or more issuer pairs
+     *         registry holds none, holds only the back-compat {@code default} seed, holds a
+     *         brand too long to store in a {@code varchar(64)} {@code domain} column, or
+     *         holds two or more issuer pairs
      */
     public String soleConfiguredBrand() {
+        return soleConfiguredBrand(registry);
+    }
+
+    /**
+     * The same derivation taken from a registry directly, for the callers that hold the
+     * {@link DomainRegistry} bean but not this {@code @Component} — {@code WikiBrandCatalog},
+     * which must report whether the write path consults {@code targetDomain} and would
+     * otherwise have to keep a SECOND copy of this rule and drift from it.
+     *
+     * @param registry the issuer-to-brand registry to read; must not be {@code null}
+     * @return the single configured non-{@code default}, storable brand, or {@code null}
+     */
+    public static String soleConfiguredBrand(final DomainRegistry registry) {
         // 2+ pairs: there is no single brand to assume, and the SUPERADMIN write path already
         // FAILS CLOSED (400) there rather than stamping anything. Left exactly as it was.
         if (registry.isMultiIssuer()) {
@@ -172,7 +187,15 @@ public class PrincipalDomain {
         String only = known.iterator().next();
         // The back-compat seed's value is literally "default", which isKnownDomain rejects —
         // so a single-issuer cluster keeps answering null and keeps stamping "default".
-        return registry.isKnownDomain(only) ? only : null;
+        if (!registry.isKnownDomain(only)) {
+            return null;
+        }
+        // The SAME narrowing WikiBrandCatalog and WikiLaunchDomain apply: isKnownDomain has no
+        // length cap but every `domain` column is varchar(64), and DomainRegistry.sanitize()
+        // guarantees the alphabet, not the ceiling. Stamping an over-long brand would turn a
+        // write that used to be an inert 200 into a DB constraint failure (500), so an
+        // unstorable brand is treated as "no brand" and the legacy 'default' stamp is kept.
+        return WikiLaunchDomain.isSpellableAsDomainColumn(only) ? only : null;
     }
 
     /**

@@ -75,6 +75,15 @@ class WikiAccessSingleBrandStampTest {
     private static final DomainRegistry PAIR_NAMED_DEFAULT =
             new DomainRegistry("https://id.acme.example", "https://id.acme.example=default");
 
+    /**
+     * One pair whose brand is 65 characters — {@code DomainRegistry.sanitize()} guarantees the
+     * alphabet but NOT the {@code varchar(64)} ceiling every {@code domain} column carries.
+     */
+    private static final String OVERLONG = "a".repeat(65);
+
+    private static final DomainRegistry PAIR_TOO_LONG_TO_STORE = new DomainRegistry(
+            "https://id.acme.example", "https://id.acme.example=" + OVERLONG);
+
     /** TWO configured pairs: PR #39's already-correct fail-closed shape. */
     private static final DomainRegistry TWO_PAIRS = new DomainRegistry(
             "https://id.acme.example",
@@ -337,6 +346,31 @@ class WikiAccessSingleBrandStampTest {
         }
 
         /**
+         * A brand the {@code domain} column could not hold (65 characters against a
+         * {@code varchar(64)}) is treated as NO brand, so the write keeps the legacy
+         * {@code default} stamp. Stamping it would turn a write that used to be an inert
+         * {@code 200} into a DB constraint failure — a regression dressed up as a fix. This is
+         * the same narrowing {@code WikiLaunchDomain} and {@code WikiBrandCatalog} already
+         * apply, called rather than copied.
+         */
+        @Test
+        void aBrandTooLongForTheDomainColumn_isNotTreatedAsTheBrand() {
+            assertThat(OVERLONG).hasSize(65);
+            assertThat(PAIR_TOO_LONG_TO_STORE.knownDomains())
+                    .as("premise: the registry really did accept it")
+                    .containsExactly(OVERLONG);
+            assertThat(PAIR_TOO_LONG_TO_STORE.isKnownDomain(OVERLONG))
+                    .as("premise: isKnownDomain alone has no length cap, so it would pass")
+                    .isTrue();
+
+            WikiAccessRepository repo = echoingRepo();
+            serviceOn(PAIR_TOO_LONG_TO_STORE, repo)
+                    .ban("victim", "abuse", null, principal(ISS_ACME, "root", "superadmin"))
+                    .block();
+            assertThat(stampedDomain(repo)).isEqualTo(DomainRegistry.DEFAULT_DOMAIN);
+        }
+
+        /**
          * One configured pair whose brand is spelled literally {@code default} is NOT a real
          * brand — every principal there still resolves {@code default}, so the write must keep
          * stamping it and the field must stay inert.
@@ -416,6 +450,21 @@ class WikiAccessSingleBrandStampTest {
         @Test
         void twoConfiguredPairs_haveNoSoleBrand() {
             assertThat(new PrincipalDomain(TWO_PAIRS).soleConfiguredBrand()).isNull();
+        }
+
+        @Test
+        void aBrandTooLongToStore_isNotASoleBrand() {
+            assertThat(new PrincipalDomain(PAIR_TOO_LONG_TO_STORE).soleConfiguredBrand()).isNull();
+        }
+
+        /** The static overload WikiBrandCatalog calls must agree with the instance one. */
+        @Test
+        void theStaticOverload_agreesWithTheInstanceMethod() {
+            for (DomainRegistry r : List.of(ONE_PAIR, BACK_COMPAT, NOTHING,
+                    PAIR_NAMED_DEFAULT, PAIR_TOO_LONG_TO_STORE, TWO_PAIRS)) {
+                assertThat(PrincipalDomain.soleConfiguredBrand(r))
+                        .isEqualTo(new PrincipalDomain(r).soleConfiguredBrand());
+            }
         }
 
         /**
