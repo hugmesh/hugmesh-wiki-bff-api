@@ -13,6 +13,7 @@ import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.jwt.Jwt;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.wikibff.security.PrincipalDomain;
@@ -57,6 +58,8 @@ class WikiServiceTest extends PostgresTestSupport {
     /** Raw handles for the delete tests: prove rows/attachments exist or not by PRIMARY KEY,
      *  and plant a same-slug {@code default}-brand row with a chosen id. */
     @Autowired WikiAttachmentDataRepository attachmentData;
+    /** Needed to build a REAL-repository subclass that reproduces the resolve/delete race. */
+    @Autowired WikiPageDataRepository pageData;
     @Autowired DatabaseClient db;
 
     private WikiService service;
@@ -321,6 +324,74 @@ class WikiServiceTest extends PostgresTestSupport {
 
             assertThat(pages.findById(py.id(), null).blockOptional()).isPresent();
             assertThat(attachmentData.existsById(ay).block()).isTrue();
+        }
+
+        /**
+         * The REPOSITORY half of the zero-row branch, against the REAL database. The service's
+         * "0 rows ⇒ 404, never 204" guard is built on {@code filter(deleted -> deleted > 0)},
+         * so it depends entirely on what Spring Data R2DBC's {@code @Modifying Mono<Long>}
+         * emits when the DELETE matches no row — which no test proved. MEASURED here against
+         * Postgres: it emits {@code 0L}, it does NOT complete empty.
+         *
+         * <p>An unrelated page and its attachment are planted first, so this also pins that
+         * the id-pinned statement touches nothing else. The SERVICE half — that a vanished
+         * row really does surface as a 404 rather than a silent 204 — is
+         * {@link #serviceDelete_rowVanishesBetweenResolveAndDelete_realDb_is404_neverSilent204()}.
+         */
+        @Test
+        void deleteById_idMatchesNoRow_realDbZeroRowContract_andDestroysNothing() {
+            String s = slug("del-zero-row");
+            WikiDto.Page survivor = service.create(create(s, "Survivor", "y"), adminY).block();
+            String survivorAtt = attach(survivor.id(), "brandy", "keep.png");
+            String absentId = "aaaaaaaa-aaaa-4aaa-8aaa-" + String.format("%012x", SEQ.incrementAndGet());
+
+            StepVerifier.create(pages.deleteById(absentId))
+                    .expectNext(0L)
+                    .as("a DELETE matching no row emits the count 0 — not an empty Mono, "
+                            + "and never a value the > 0 filter would let through")
+                    .verifyComplete();
+
+            assertThat(pages.findById(survivor.id(), null).blockOptional())
+                    .as("the unrelated page survives a no-match delete").isPresent();
+            assertThat(attachmentData.existsById(survivorAtt).block())
+                    .as("and so does its attachment — nothing is destroyed ahead of the page").isTrue();
+        }
+
+        /**
+         * The SERVICE half of the zero-row branch, against the REAL database and with NO mocks.
+         * The race the guard exists for — the resolved row vanishing before the DELETE runs — is
+         * reproduced deterministically by a REAL {@link WikiPageRepository} subclass whose
+         * {@code findBySlug} removes the row it just resolved. The delete then matches nothing.
+         *
+         * <p>Without the guard this is the exact defect of issue #15's second half: a 204 for a
+         * delete that removed nothing. With it, a 404 — and NOTHING is audited, because a page
+         * that was never deleted must not leave a {@code wiki.page.delete} trail.
+         */
+        @Test
+        void serviceDelete_rowVanishesBetweenResolveAndDelete_realDb_is404_neverSilent204() {
+            String s = slug("del-vanish");
+            service.create(create(s, "Vanishing", "y"), adminY).block();
+
+            WikiPageRepository vanishing = new WikiPageRepository(pageData) {
+                @Override
+                public Mono<WikiPage> findBySlug(String slug, String domain) {
+                    return super.findBySlug(slug, domain)
+                            .flatMap(p -> db.sql("DELETE FROM wiki_page WHERE id = :id")
+                                    .bind("id", p.id()).fetch().rowsUpdated().thenReturn(p));
+                }
+            };
+            WikiService racing = new WikiService(
+                    vanishing, audit, new MarkdownRenderer(), new PrincipalDomain(MULTI));
+
+            StepVerifier.create(racing.delete(s, su))
+                    .expectErrorSatisfies(e -> assertThat(((ApiException) e).status().value())
+                            .as("a delete that removed no row is a 404, never a silent 204")
+                            .isEqualTo(404))
+                    .verify();
+
+            assertThat(audit.list("brandy").collectList().block())
+                    .as("nothing is audited for a delete that removed nothing")
+                    .noneMatch(a -> s.equals(a.target()) && "wiki.page.delete".equals(a.action()));
         }
     }
 
