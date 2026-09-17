@@ -37,6 +37,11 @@ Add under `Settings -> Secrets and variables -> Actions` on the **Secrets** tab
 | `GITLAB_API_V4_URL` | The in-cluster GitLab API v4 base, e.g. `https://gitlab.<tailnet>/api/v4` |
 | `GITLAB_GROUP_ID` | The HugMesh GitLab group id |
 
+GitHub masks a secret's **value** everywhere it appears in job output, so once the
+short numeric `GITLAB_GROUP_ID` is a secret, every unrelated occurrence of those
+digits in a log shows as `***`. Expected, harmless, and the price of the single
+namespace decision 43a chose — see the full runbook, §5.
+
 **Renamed by decision 43a.** This repo's `release.yml` previously read
 `secrets.GITLAB_CI_JOB_TOKEN` + `vars.CI_API_V4_URL` + `vars.GITLAB_GROUP_ID`.
 `vars.` and `secrets.` are different namespaces, so a secret never satisfied those
@@ -64,3 +69,17 @@ env -u GH_TOKEN -u GITHUB_TOKEN gh api repos/hugmesh/hugmesh-wiki-bff-api/action
 
 When registering, name this repo's runner `hugmesh-x86-wiki` in its own
 directory on the host, so one box can serve all three repos concurrently.
+
+## Scope — this is three repos, not the org
+
+Decision 43a covers `hugmesh-forum-bff-api`, `hugmesh-wiki-bff-api` and
+`hugmesh-mesh-bff-api`, and that is exactly what changed. Measured 2026-09-17,
+**three other repos still read these same registry inputs under different names**:
+`hugmesh-mod-bff-api` (`secrets.CI_JOB_TOKEN` + `vars.CI_API_V4_URL` +
+`vars.GITLAB_GROUP_ID`), `hugmesh-owncast-bff-api` (`secrets.CI_API_V4_URL` /
+`secrets.GITLAB_GROUP_ID` / `secrets.CI_JOB_TOKEN`) and `hugmesh-admin-bff-api`
+(`vars.MAVEN_REGISTRY_API_URL` / `vars.MAVEN_REGISTRY_GROUP_ID` /
+`secrets.MAVEN_REGISTRY_TOKEN`). All 25 `release.yml` files in the org still say
+`runs-on: ubuntu-latest` except the three this change moves. **No issue tracks the
+remainder.** Do not read the table above as an org-wide convention; the full census
+is §8.1 of the forum-bff runbook.
