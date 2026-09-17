@@ -264,7 +264,7 @@
       "post" : {
         "tags" : [ "Wiki Access" ],
         "summary" : "TIMEOUT a USER from wiki read for a bounded window (an active banned override with a future expires_at; auto-restores on expiry). ADMIN/SUPERADMIN, own-brand.",
-        "description" : "Creates (or returns existing active) a {@code banned} override row with a future {@code expires_at} computed from {@code ttlSeconds}. Once the timestamp passes, {@link WikiAccessGuard} treats the row as inactive — no write is needed on expiry. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "description" : "Creates (or returns existing active) a {@code banned} override row with a future {@code expires_at} computed from {@code ttlSeconds}. Once the timestamp passes, {@link WikiAccessGuard} treats the row as inactive — no write is needed on expiry. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
         "operationId" : "wikiAccessTimeout",
         "requestBody" : {
           "content" : {
@@ -288,7 +288,7 @@
             }
           },
           "400" : {
-            "description" : "Request body validation failed (e.g. missing userSubject or non-positive ttlSeconds)."
+            "description" : "Request body validation failed (e.g. missing userSubject or non-positive ttlSeconds), OR the SUPERADMIN targetDomain does not name a brand this deployment configures (with 2+ brands it must name one; with exactly 1 it may be omitted but must not name a different one)."
           },
           "401" : {
             "description" : "No valid JWT present in the request."
@@ -306,7 +306,7 @@
       "post" : {
         "tags" : [ "Wiki Access" ],
         "summary" : "GRANT a USER permanent wiki read access (an active wiki_access read override). ADMIN/SUPERADMIN, own-brand.",
-        "description" : "Creates (or returns existing active) a {@code read} override row for the target user in the actor's brand. Idempotent: if an active {@code read} row already exists for this user in this brand it is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "description" : "Creates (or returns existing active) a {@code read} override row for the target user in the actor's brand. Idempotent: if an active {@code read} row already exists for this user in this brand it is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
         "operationId" : "wikiAccessGrant",
         "requestBody" : {
           "content" : {
@@ -330,7 +330,7 @@
             }
           },
           "400" : {
-            "description" : "Request body validation failed (e.g. missing or blank userSubject)."
+            "description" : "Request body validation failed (e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does not name a brand this deployment configures (with 2+ brands it must name one; with exactly 1 it may be omitted but must not name a different one)."
           },
           "401" : {
             "description" : "No valid JWT present in the request."
@@ -348,7 +348,7 @@
       "post" : {
         "tags" : [ "Wiki Access" ],
         "summary" : "BAN a USER from wiki read permanently (an active banned override, expires_at NULL). Denies even a role-holder/grantee. ADMIN/SUPERADMIN, own-brand.",
-        "description" : "Creates (or returns existing active) a permanent {@code banned} override row ({@code expires_at} NULL). The ban takes precedence over any role-based read permission; {@link WikiAccessGuard} denies access on every request until the row is revoked. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
+        "description" : "Creates (or returns existing active) a permanent {@code banned} override row ({@code expires_at} NULL). The ban takes precedence over any role-based read permission; {@link WikiAccessGuard} denies access on every request until the row is revoked. Idempotent: an existing active {@code banned} row is returned unchanged.<table><tr><th>Role</th><th>Permitted</th><th>Scope</th></tr><tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr><tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr><tr><td>MOD / USER</td><td>No</td><td>—</td></tr></table>",
         "operationId" : "wikiAccessBan",
         "requestBody" : {
           "content" : {
@@ -372,7 +372,7 @@
             }
           },
           "400" : {
-            "description" : "Request body validation failed (e.g. missing or blank userSubject)."
+            "description" : "Request body validation failed (e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does not name a brand this deployment configures (with 2+ brands it must name one; with exactly 1 it may be omitted but must not name a different one)."
           },
           "401" : {
             "description" : "No valid JWT present in the request."

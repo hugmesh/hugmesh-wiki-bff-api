@@ -71,14 +71,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access read override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing or blank userSubject).", content = @Content),
+                    + "(e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does "
+                    + "not name a brand this deployment configures (with 2+ brands it must name "
+                    + "one; with exactly 1 it may be omitted but must not name a different one).",
+                    content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)
@@ -103,14 +106,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access banned override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing userSubject or non-positive ttlSeconds).", content = @Content),
+                    + "(e.g. missing userSubject or non-positive ttlSeconds), OR the SUPERADMIN "
+                    + "targetDomain does not name a brand this deployment configures (with 2+ "
+                    + "brands it must name one; with exactly 1 it may be omitted but must not "
+                    + "name a different one).", content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)
@@ -135,14 +141,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access banned override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing or blank userSubject).", content = @Content),
+                    + "(e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does "
+                    + "not name a brand this deployment configures (with 2+ brands it must name "
+                    + "one; with exactly 1 it may be omitted but must not name a different one).",
+                    content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)

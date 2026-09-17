@@ -85,6 +85,13 @@ public final class WikiAccessDto {
      * passing {@code targetDomain="brandx"} so the row lands in (and the read guard matches)
      * the victim's brand instead of the inert {@code default} domain.
      *
+     * <p>How the field is read depends on how many brands the deployment configures, and the
+     * full table is on {@code WikiAccessService.writeDomain}. In short: with TWO OR MORE
+     * configured brands a SUPERADMIN must name one or take a {@code 400}; with EXACTLY ONE
+     * the field may be omitted (that brand is stamped) and naming any other brand is a
+     * {@code 400}; with NO brand configured at all the field is inert and the write is
+     * stamped {@code default} as it always was.
+     *
      * @param userSubject  Casdoor subject of the principal to grant or ban; required,
      *                     max 400 characters
      * @param reason       optional free-text audit reason for the action; max 1 024 characters
@@ -105,7 +112,8 @@ public final class WikiAccessDto {
      * {@code POST .../access/timeout} — a {@code banned} override with a FUTURE expiry.
      * {@code ttlSeconds} drives the auto-restore instant; it must be positive.
      * {@code targetDomain} is the VICTIM's brand for a SUPERADMIN cross-brand timeout (same
-     * contract as {@link GrantOrBan#targetDomain()}; ignored for a scoped ADMIN).
+     * contract as {@link GrantOrBan#targetDomain()}, including the single-configured-brand
+     * rules; ignored for a scoped ADMIN).
      *
      * @param userSubject  Casdoor subject of the principal to timeout; required,
      *                     max 400 characters

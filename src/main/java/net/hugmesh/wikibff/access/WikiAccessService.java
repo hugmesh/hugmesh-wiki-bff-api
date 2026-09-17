@@ -24,8 +24,11 @@ import java.time.Instant;
  *
  * <p>All writes are DOMAIN-scoped: the acting principal's brand is derived SERVER-SIDE
  * from the validated issuer ({@link PrincipalDomain}) and stamped on the row, so a scoped
- * ADMIN of brand X can only grant/ban/restore WITHIN brand X; a SUPERADMIN (null scope)
- * writes to the platform {@code default} domain (its acts are cross-domain at read time).
+ * ADMIN of brand X can only grant/ban/restore WITHIN brand X. A SUPERADMIN has a null scope
+ * and so cannot derive the victim's brand from its own token; {@link #writeDomain} resolves
+ * it instead — the named {@code targetDomain} when two or more brands are configured, the
+ * single configured brand when there is exactly one, and the platform {@code default} domain
+ * only when no real brand is configured at all.
  *
  * <ul>
  *   <li>{@link #grant} — give a USER an ACTIVE permanent {@code read} override
@@ -237,15 +240,47 @@ public class WikiAccessService {
      *       can never write into another brand.</li>
      *   <li>A SUPERADMIN ({@link #scopeOf} returns {@code null}, the cross-domain actor):
      *       the row must land in the VICTIM's brand, which the actor's null scope cannot
-     *       supply — so we resolve the {@code targetDomain} body field against the trusted
-     *       {@link DomainRegistry} ({@link PrincipalDomain#resolveKnownDomain}). In
-     *       multi-issuer mode a SUPERADMIN MUST name a real victim brand: a missing/unknown
-     *       target FAILS CLOSED ({@code 400}) rather than being normalised to {@code default},
-     *       which the read guard would never match against a non-default user (the silent
-     *       no-effect ban this fix closes). In single-issuer mode every principal is
-     *       {@code default}, so a SUPERADMIN write keeps the legacy {@code default} brand
-     *       (behaviour unchanged).</li>
+     *       supply. Three configurations, three answers — see the table below.</li>
      * </ul>
+     *
+     * <h3>The SUPERADMIN cases, exhaustively</h3>
+     *
+     * <pre>
+     *  app.tenancy.issuers  | a USER resolves | targetDomain     | stamped   | before decision 26
+     *  ─────────────────────┼─────────────────┼──────────────────┼───────────┼────────────────────
+     *  unset (back-compat)  | "default"       | anything (inert) | "default" | same
+     *  ONE pair "=acme"     | "acme"          | absent/blank     | "acme"    | "default" (INERT!)
+     *  ONE pair "=acme"     | "acme"          | "acme"           | "acme"    | "default" (INERT!)
+     *  ONE pair "=acme"     | "acme"          | "globex"         | 400       | "default" (INERT!)
+     *  two or more pairs    | per-issuer      | a known brand    | that brand| same
+     *  two or more pairs    | per-issuer      | absent/unknown   | 400       | same
+     * </pre>
+     *
+     * <p><b>Back-compat is UNCHANGED, by construction.</b> With {@code app.tenancy.issuers}
+     * empty the registry holds only the {@code {issuer -> "default"}} seed, so
+     * {@link PrincipalDomain#soleConfiguredBrand} answers {@code null} and this method returns
+     * {@link DomainRegistry#DEFAULT_DOMAIN} down the same branch it always did. Every principal
+     * on such a mesh really IS {@code default}, so the stamp matches the guard's read and there
+     * is nothing to fix; {@code targetDomain} stays inert there rather than becoming a new way
+     * to get a {@code 400} out of a deployment that never had one.
+     *
+     * <p><b>One configured pair is a real brand</b> (operator decision 26 on
+     * hugmesh-generator#347, issue #21). It was the one shape where the two sides disagreed:
+     * every user resolved {@code acme} while a SUPERADMIN grant/timeout/ban was stamped
+     * {@code default}, so {@link WikiAccessGuard} — which reads back
+     * {@code activeFor(subject, "acme")} — never matched the row and the ban silently did
+     * nothing. The stamp is now the configured brand, and a {@code targetDomain} naming any
+     * OTHER brand is a {@code 400} instead of a write that lands somewhere the operator did
+     * not ask for. A caller that omits {@code targetDomain} needs no change: there is exactly
+     * one brand it could have meant.
+     *
+     * <p><b>Two or more pairs are untouched</b> — PR #39's fail-closed contract stands: name a
+     * known victim brand or take a {@code 400}. That case was never silent, so it is not this
+     * fix's business.
+     *
+     * <p>The error message names the CONFIGURED brand (registry-derived, sanitised to
+     * {@code [a-z0-9-]} at construction) and deliberately does NOT echo the caller's own
+     * string back into the response body.
      */
     private Mono<String> writeDomain(Authentication actor, String targetDomain, String verb) {
         String scope = scopeOf(actor);
@@ -253,10 +288,26 @@ public class WikiAccessService {
         if (scope != null) {
             return Mono.just(scope);
         }
-        // SUPERADMIN cross-domain write: in single-issuer mode there is no real victim brand
-        // to name, so keep the legacy default (unchanged behaviour).
+        // SUPERADMIN cross-domain write, 0 or 1 configured issuer pairs.
         if (!principalDomain.isMultiIssuer()) {
-            return Mono.just(DomainRegistry.DEFAULT_DOMAIN);
+            String sole = principalDomain.soleConfiguredBrand();
+            // No real brand configured (nothing set, or the back-compat {issuer -> "default"}
+            // seed): every principal genuinely resolves "default", so stamping it is correct
+            // and targetDomain stays inert. BYTE-FOR-BYTE the pre-decision-26 behaviour.
+            if (sole == null) {
+                return Mono.just(DomainRegistry.DEFAULT_DOMAIN);
+            }
+            // Exactly one configured pair: that IS this mesh's brand. Stamp it, so the row
+            // lands where WikiAccessGuard looks instead of the inert 'default'.
+            if (targetDomain == null || targetDomain.isBlank() || sole.equals(targetDomain)) {
+                return Mono.just(sole);
+            }
+            // A named brand that is not the one this mesh has: FAIL LOUDLY. Silently writing
+            // the sole brand anyway would honour a request nobody made; silently writing the
+            // named one would strand the row in a domain no principal here can resolve.
+            return Mono.error(ApiException.badRequest(
+                    "a SUPERADMIN " + verb + " can only target this deployment's single "
+                            + "configured brand '" + sole + "'; leave targetDomain unset to use it"));
         }
         // Multi-brand: resolve the victim brand from the body against the trusted registry and
         // FAIL CLOSED if it is absent/unknown — a default-stamped ban is silently ineffective.
