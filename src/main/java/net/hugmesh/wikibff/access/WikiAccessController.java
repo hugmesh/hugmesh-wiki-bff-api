@@ -89,14 +89,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access read override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing or blank userSubject).", content = @Content),
+                    + "(e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does "
+                    + "not name a brand this deployment configures (with 2+ brands it must name "
+                    + "one; with exactly 1 it may be omitted but must not name a different one).",
+                    content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)
@@ -121,14 +124,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access banned override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing userSubject or non-positive ttlSeconds).", content = @Content),
+                    + "(e.g. missing userSubject or non-positive ttlSeconds), OR the SUPERADMIN "
+                    + "targetDomain does not name a brand this deployment configures (with 2+ "
+                    + "brands it must name one; with exactly 1 it may be omitted but must not "
+                    + "name a different one).", content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)
@@ -153,14 +159,17 @@ public class WikiAccessController {
                     + "<table>"
                     + "<tr><th>Role</th><th>Permitted</th><th>Scope</th></tr>"
                     + "<tr><td>ADMIN</td><td>Yes</td><td>Own brand only</td></tr>"
-                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain (platform default)</td></tr>"
+                    + "<tr><td>SUPERADMIN</td><td>Yes</td><td>Cross-domain: the named targetDomain brand; the single configured brand when only one is configured; the platform default domain only when no brand is configured at all</td></tr>"
                     + "<tr><td>MOD / USER</td><td>No</td><td>—</td></tr>"
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Active wiki_access banned override returned "
                     + "(newly created or pre-existing idempotent row)."),
             @ApiResponse(responseCode = "400", description = "Request body validation failed "
-                    + "(e.g. missing or blank userSubject).", content = @Content),
+                    + "(e.g. missing or blank userSubject), OR the SUPERADMIN targetDomain does "
+                    + "not name a brand this deployment configures (with 2+ brands it must name "
+                    + "one; with exactly 1 it may be omitted but must not name a different one).",
+                    content = @Content),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold ADMIN or SUPERADMIN role.", content = @Content),
             @ApiResponse(responseCode = "500", description = "Unexpected DB error writing the override row.", content = @Content)
@@ -283,15 +292,22 @@ public class WikiAccessController {
                     + "<ul>"
                     + "<li><code>brands</code> — DomainRegistry.knownDomains() filtered through "
                     + "DomainRegistry.isKnownDomain, i.e. exactly the values a grant/timeout/ban "
-                    + "may name in targetDomain. Sorted. Empty on a single-issuer deployment.</li>"
+                    + "may name in targetDomain. Sorted. Empty ONLY on a back-compat deployment "
+                    + "that configures no brand at all (app.tenancy.issuers unset); a deployment "
+                    + "with exactly ONE configured pair is still single-issuer to the decoder but "
+                    + "DOES list that one brand.</li>"
                     + "<li><code>launchDomain</code> — the domain this wiki is launched on, from "
                     + "the same derivation the 007 re-stamp target uses; falls back to "
                     + "<code>hugmesh</code>. NOT necessarily a member of <code>brands</code>: on a "
                     + "2+-brand deployment there is no single launch domain, so check membership "
                     + "before preselecting it.</li>"
-                    + "<li><code>targetDomainHonoured</code> — false when fewer than two issuers "
-                    + "are configured, where WikiAccessService.writeDomain ignores the field and "
-                    + "stamps <code>default</code> regardless of the body.</li>"
+                    + "<li><code>targetDomainHonoured</code> — whether WikiAccessService.writeDomain "
+                    + "reads the field at all. True whenever at least one real brand is configured "
+                    + "(with exactly one, the field may be omitted and that brand is stamped, while "
+                    + "naming a different brand is a 400). False only on a back-compat single-issuer "
+                    + "deployment, where every principal is <code>default</code>, the field is inert "
+                    + "and <code>brands</code> is empty — so false now always means there is nothing "
+                    + "to pick, never that a real choice is being discarded.</li>"
                     + "</ul>"
                     + "No new disclosure: a SUPERADMIN is cross-domain by definition and can "
                     + "already read every brand's access rows and audit trail."
@@ -302,7 +318,8 @@ public class WikiAccessController {
                     + "</table>")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "The brand catalogue. brands may be "
-                    + "an empty list (single-issuer back-compat, where targetDomain is ignored)."),
+                    + "an empty list — only on a back-compat deployment that configures no brand "
+                    + "at all, which is also the only shape where targetDomain is ignored."),
             @ApiResponse(responseCode = "401", description = "No valid JWT present in the request.", content = @Content),
             @ApiResponse(responseCode = "403", description = "Caller does not hold SUPERADMIN role.", content = @Content)
     })

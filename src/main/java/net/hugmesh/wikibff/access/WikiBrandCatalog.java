@@ -5,6 +5,7 @@ import java.util.List;
 
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.wikibff.config.WikiLaunchDomain;
+import net.hugmesh.wikibff.security.PrincipalDomain;
 
 /**
  * The BRAND CATALOGUE served to the admin console's target-brand picker
@@ -29,45 +30,47 @@ import net.hugmesh.wikibff.config.WikiLaunchDomain;
  * {@code PrincipalDomain.resolveKnownDomain} calls on the write path, and reports separately
  * whether {@code targetDomain} is consulted at all.
  *
- * <h2>Measured: the field is inert below two configured issuer PAIRS</h2>
+ * <h2>Measured: when the field is consulted at all</h2>
  *
- * <p>{@code WikiAccessService.writeDomain} consults {@code targetDomain} only when
+ * <p>{@code WikiAccessService.writeDomain} used to consult {@code targetDomain} only when
  * {@link DomainRegistry#isMultiIssuer()} — which is {@code issuerToDomain.size() > 1}, i.e.
- * a count of configured PAIRS, not of distinct brands. So:
+ * a count of configured PAIRS, not of distinct brands. Issue #21 measured what that cost at
+ * exactly one pair, and the operator answered it on 2026-09-16 (<em>"Fix: stamp the
+ * configured brand"</em>, decision 26 on hugmesh-generator#347). The current contract:
  *
  * <pre>
  *  app.tenancy.issuers        | a USER resolves | a SUPERADMIN write is stamped | picker
  *  ───────────────────────────┼─────────────────┼───────────────────────────────┼────────
  *  unset                      | "default"       | "default"                     | inert, and correct
- *  ONE pair "https://i=acme"  | "acme"          | "default"  (!)                | inert, and WRONG
+ *  ONE pair "https://i=acme"  | "acme"          | "acme" (or 400 on a mismatch) | live
  *  two or more PAIRS          | per-issuer      | the named targetDomain        | live
  * </pre>
  *
- * <p>The middle row is a real hazard, not a curiosity: a SUPERADMIN's grant or BAN is stamped
- * {@code default} while every user of that deployment resolves {@code acme}, so
- * {@link WikiAccessGuard} — which reads back {@code activeFor(subject, "acme")} — never matches
- * it. That is exactly the silently-ineffective ban PR #39 closed for 2+ brands and left open at
- * exactly 1. It matters more now than it did: deriving the 007 re-stamp target from the launch
- * domain (issue #19) makes the single-pair mapping the FIRST-CLASS single-brand launch shape.
+ * <p>The middle row used to stamp {@code default} while every user of that deployment
+ * resolved {@code acme}, so {@link WikiAccessGuard} — which reads back
+ * {@code activeFor(subject, "acme")} — never matched it and a SUPERADMIN's ban silently did
+ * nothing. That was the silently-ineffective ban PR #39 closed for 2+ brands and left open at
+ * exactly 1; it is now closed at 1 too, which matters because deriving the 007 re-stamp target
+ * from the launch domain (issue #19) makes the single-pair mapping the FIRST-CLASS single-brand
+ * launch shape. The picker is therefore LIVE on that shape and the console should render a
+ * control, not a warning.
  *
- * <p>Changing {@code writeDomain} to fail closed there would turn today's silent no-op into a
- * {@code 400} for existing deployments — a behaviour change nobody asked for — so this class
- * does NOT change it; it was filed for a decision as issue #21. It REPORTS it: {@code targetDomainHonoured} is false there while
- * {@code brands} is non-empty, which is a combination the console can detect and warn on
- * instead of rendering a control that does nothing.
+ * <p>{@code targetDomainHonoured} is still false — with {@code brands} empty — on a
+ * back-compat single-issuer deployment, where every principal genuinely is {@code default}
+ * and the field really is inert. That combination (no brands, not honoured) is the correct
+ * "nothing to pick" signal; the old hazard combination (brands non-empty while not honoured)
+ * can no longer occur.
  *
- * <p>THE OPERATOR ANSWERED #21 ON 2026-09-16 — <em>"Fix: stamp the configured brand"</em>,
- * queued behind this lane. When that lands, {@code writeDomain} stamps the sole configured
- * brand and a mismatched {@code targetDomain} becomes a {@code 400}, so the line below
- * becomes wrong and MUST move with it. Five artefacts pin today's contract and have to
- * change in the same commit: {@code WikiAccessService.writeDomain}; the
- * {@code registry.isMultiIssuer()} expression below; {@code
- * WikiBrandCatalogTest.SingleConfiguredPair}, which asserts {@code targetDomainHonoured}
- * is false; the committed {@code openapi.json} description ("false when fewer than two
- * issuers are configured") in this repo AND hugmesh-wiki-ui's regenerated copy; and the
- * UI's five {@code BrandMode}s. Nothing fails if they drift apart — the console would
- * simply keep warning that the server discards a field the server now enforces. The list
- * is also recorded on #21.
+ * <p>ONE REPO AWAY, and MEASURED rather than assumed (a skeptic pass corrected an earlier
+ * claim here that said the opposite): hugmesh-wiki-ui derives five {@code BrandMode}s from
+ * these three fields, but it derives them AT RUNTIME — {@code applyCatalog} branches on
+ * {@code targetDomainHonoured} FIRST and reads {@code brands.length} only to tell the two
+ * INERT shapes apart. So the moment this bff reports {@code honoured=true} the shipped console
+ * renders its live {@code picker} with NO code change and stops warning on its own; there is
+ * no console edit paired to this class. The only artefact that does go stale is the copy of
+ * this repo's {@code openapi.json} that repo regenerates its typed client from, and the
+ * decision-26 delta there is description text only. That hand-off is recorded on #21 and on
+ * hugmesh-wiki-ui#3.
  *
  * <h2>Deliberately NOT a {@code @Component}</h2>
  *
@@ -129,6 +132,10 @@ public class WikiBrandCatalog {
         return new WikiAccessDto.Brands(
                 brands,
                 WikiLaunchDomain.resolveFrom(registry, issuerUri).domain(),
-                registry.isMultiIssuer());
+                // NOT a re-implementation of the write path's rule either: writeDomain reads
+                // targetDomain in exactly two states — 2+ configured pairs, or a single
+                // configured brand — and the second of those is PrincipalDomain's own
+                // predicate, called here rather than copied.
+                registry.isMultiIssuer() || PrincipalDomain.soleConfiguredBrand(registry) != null);
     }
 }

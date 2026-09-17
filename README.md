@@ -183,13 +183,48 @@ per-principal read overrides:
 - **grant / timeout / ban / restore** are `WIKI_WRITE` operations served under
   `/bff/wiki/admin/access/**`. A scoped **ADMIN** always writes within their own
   issuer-derived brand (a `targetDomain` body field, if sent, is inert). A **SUPERADMIN**
-  is cross-domain: the write lands in the `targetDomain` brand (validated against the
-  trusted `DomainRegistry`) so it lands where `WikiAccessGuard`'s read actually looks. In
-  multi-issuer mode a SUPERADMIN write with a missing/unknown `targetDomain` **fails
-  closed (400)** rather than silently stamping an inert `default` row; in single-issuer
-  mode every principal is `default`, so behaviour there is unchanged. This closed a real
-  gap (fixed in #39): a SUPERADMIN cross-brand ban used to be stamped to `default` while
-  the read guard queried the victim's own brand, so the ban silently never took effect.
+  has a `null` scope and so cannot derive the victim's brand from its own token;
+  `WikiAccessService.writeDomain` resolves it from the configuration instead, so the row
+  lands where `WikiAccessGuard`'s read actually looks. The whole decision, exhaustively:
+
+  | `app.tenancy.issuers` | a USER resolves | SUPERADMIN `targetDomain` | row is stamped |
+  | --- | --- | --- | --- |
+  | unset (back-compat single-issuer) | `default` | anything — **inert** | `default` |
+  | exactly one pair, e.g. `https://id.acme=acme` | `acme` | absent or blank | `acme` |
+  | exactly one pair | `acme` | `acme` | `acme` |
+  | exactly one pair | `acme` | any other brand | **400** |
+  | two or more pairs | per-issuer | a known brand | that brand |
+  | two or more pairs | per-issuer | absent or unknown | **400** |
+
+  The 2+ row closed a real gap (fixed in #39): a SUPERADMIN cross-brand ban used to be
+  stamped `default` while the read guard queried the victim's own brand, so the ban
+  silently never took effect. The **exactly-one-pair** rows closed the same gap at the one
+  size #39 left open (fixed under issue #21 / operator decision 26): one configured pair is
+  a real brand, not back-compat, so a SUPERADMIN write is stamped with it instead of the
+  inert `default`, and a `targetDomain` naming a brand this deployment does not have is now
+  a loud `400` instead of a silently discarded field. **Back-compat is untouched**: with
+  `app.tenancy.issuers` empty every principal genuinely is `default`, so the stamp already
+  matched the guard and `targetDomain` stays inert there — that configuration cannot see a
+  400 it did not see before.
+
+  > **Upgrading a deployment that already configures exactly one brand?** Nothing a caller
+  > sends has to change, but three things change on the server. (1) A SUPERADMIN
+  > grant/timeout/ban that previously returned `200` and did nothing now actually takes
+  > effect — if anyone has been "banning" users on this deployment and wondering why they
+  > could still read, those bans start biting. (2) A SUPERADMIN write naming some *other*
+  > brand now gets a `400`. (3) Rows already written before the upgrade are still stamped
+  > `default` and are still inert; re-issue those grants/bans, or run the 007 re-stamp
+  > (which moves `wiki_access.domain` too) as part of the cut-over. A SUPERADMIN's
+  > `revoke`, `list-active` and `history` are unscoped and can already see the old rows —
+  > but note that `revoke` clears **one row per call**: unscoped it resolves through
+  > `findFirstByUserSubjectAndAccessTypeAndStateOrderByCreatedAtDescIdAsc`, i.e. the NEWEST
+  > active row of that type in any brand. So where a stale `default` row and a new
+  > brand-stamped row coexist, the first call clears the new one and a second call is needed
+  > for the stale one. They do coexist rather than collide: `uq_wiki_access_active`
+  > (changelog 004) is a partial unique on `(domain, user_subject, access_type)` with
+  > `domain` IN the key, so the post-upgrade insert cannot trip a constraint on the old row.
+  > The leftover `default` row is inert for a branded principal, so this is tidy-up, not a
+  > correctness risk.
 - **list-active / history** are `WIKI_MANAGE` operations (SUPERADMIN only), served under
   `/bff/wiki/superadmin/access`.
 - **The target-brand catalogue** (`GET /bff/wiki/superadmin/brands`, `WIKI_MANAGE`) serves
@@ -688,6 +723,19 @@ for transparency rather than deleted from the history:
   `DomainRegistry` (see [Grant / timeout / ban overlay](#grant--timeout--ban-overlay-wiki_access)
   above), and fails closed (400) in multi-issuer mode when no known target brand is given,
   instead of silently writing an override `WikiAccessGuard` would never match.
+- ~~**With exactly ONE configured issuer pair, a SUPERADMIN grant/timeout/ban was still
+  stamped `default` — so the ban silently did nothing.**~~ **Fixed (#21, operator decision
+  26):** `writeDomain` consulted `targetDomain` only when `DomainRegistry.isMultiIssuer()`,
+  which is literally `issuerToDomain.size() > 1`. At exactly one pair every user resolved
+  the configured brand while every SUPERADMIN write was stamped `default`, so
+  `WikiAccessGuard`'s `activeFor(subject, brand)` never matched the row. The new
+  `PrincipalDomain.soleConfiguredBrand()` tells the two one-entry registries apart — a
+  configured pair (a real brand) from the back-compat `{issuer -> "default"}` seed (not one)
+  — so the write is stamped with the brand, a mismatched `targetDomain` is a 400, and the
+  back-compat case is byte-for-byte unchanged. Pinned by
+  `WikiAccessSingleBrandStampTest` (27 cases, both directions) and by
+  `WikiBrandCatalogTest`'s agreement case, which drives the REAL `writeDomain` rather than
+  restating the catalogue's own expression.
 
 ## Roadmap / out of repo
 

@@ -5,6 +5,9 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.stereotype.Component;
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.commons.security.Roles;
+import net.hugmesh.wikibff.config.WikiLaunchDomain;
+
+import java.util.Set;
 
 /**
  * Resolves the EFFECTIVE domain-scope for a request principal — the single place a
@@ -116,6 +119,83 @@ public class PrincipalDomain {
      */
     public String resolveKnownDomain(String requested) {
         return registry.isKnownDomain(requested) ? requested : null;
+    }
+
+    /**
+     * The ONE real brand this deployment is configured with, or {@code null} when it has
+     * none — the seam that lets a SUPERADMIN write be stamped with a brand the read guard
+     * will actually match on a single-brand mesh (issue #21, operator decision 26).
+     *
+     * <p>{@link #isMultiIssuer} is {@code issuerToDomain.size() > 1}, so it cannot tell the
+     * two distinct one-entry registries apart, and they need OPPOSITE answers:
+     *
+     * <pre>
+     *  app.tenancy.issuers          | registry entries        | a USER resolves | soleConfiguredBrand()
+     *  ─────────────────────────────┼─────────────────────────┼─────────────────┼──────────────────────
+     *  unset, no issuer-uri         | {} (empty)              | "default"       | null
+     *  unset, issuer-uri set        | {iss -> "default"}      | "default"       | null   (BACK-COMPAT)
+     *  "https://i=default"          | {iss -> "default"}      | "default"       | null
+     *  "https://i=acme"             | {iss -> "acme"}         | "acme"          | "acme" (A REAL BRAND)
+     *  two or more pairs            | 2+ entries              | per-issuer      | null   (caller names it)
+     * </pre>
+     *
+     * <p>The back-compat rows answer {@code null} because every principal there really does
+     * resolve {@link DomainRegistry#DEFAULT_DOMAIN} — stamping {@code default} is CORRECT for
+     * them and nothing about their behaviour changes. Only the fourth row is the defect: the
+     * user side resolves {@code acme} while the SUPERADMIN write side stamped {@code default},
+     * so the guard's {@code activeFor(subject, "acme")} never matched the row and the ban did
+     * nothing.
+     *
+     * <p>The test is deliberately the write path's own predicate, {@link
+     * DomainRegistry#isKnownDomain} — the same one {@link #resolveKnownDomain} calls — so a
+     * brand this method offers is a brand the write path accepts by construction, and the
+     * values that predicate always rejects ({@code "default"}, blank) are filtered out without
+     * this method having to know they are special. It matches {@code WikiLaunchDomain.resolve}
+     * (issue #19) on every row above except "two or more pairs": that case still requires the
+     * caller to name a victim brand (PR #39's fail-closed contract, which is LOUD, not silent)
+     * and is deliberately left untouched here.
+     *
+     * @return the single configured non-{@code default} brand, or {@code null} when the
+     *         registry holds none, holds only the back-compat {@code default} seed, holds a
+     *         brand too long to store in a {@code varchar(64)} {@code domain} column, or
+     *         holds two or more issuer pairs
+     */
+    public String soleConfiguredBrand() {
+        return soleConfiguredBrand(registry);
+    }
+
+    /**
+     * The same derivation taken from a registry directly, for the callers that hold the
+     * {@link DomainRegistry} bean but not this {@code @Component} — {@code WikiBrandCatalog},
+     * which must report whether the write path consults {@code targetDomain} and would
+     * otherwise have to keep a SECOND copy of this rule and drift from it.
+     *
+     * @param registry the issuer-to-brand registry to read; must not be {@code null}
+     * @return the single configured non-{@code default}, storable brand, or {@code null}
+     */
+    public static String soleConfiguredBrand(final DomainRegistry registry) {
+        // 2+ pairs: there is no single brand to assume, and the SUPERADMIN write path already
+        // FAILS CLOSED (400) there rather than stamping anything. Left exactly as it was.
+        if (registry.isMultiIssuer()) {
+            return null;
+        }
+        Set<String> known = registry.knownDomains();
+        // 0 entries (nothing configured at all) => no brand.
+        if (known.size() != 1) {
+            return null;
+        }
+        String only = known.iterator().next();
+        // The back-compat seed's value is literally "default", which isKnownDomain rejects —
+        // so a single-issuer cluster keeps answering null and keeps stamping "default".
+        if (!registry.isKnownDomain(only)) {
+            return null;
+        }
+        // The SAME narrowing WikiBrandCatalog and WikiLaunchDomain apply: isKnownDomain has no
+        // length cap but every `domain` column is varchar(64), and DomainRegistry.sanitize()
+        // guarantees the alphabet, not the ceiling. Stamping an over-long brand would turn a
+        // write that used to be an inert 200 into a DB constraint failure (500), so an
+        // unstorable brand is treated as "no brand" and the legacy 'default' stamp is kept.
+        return WikiLaunchDomain.isSpellableAsDomainColumn(only) ? only : null;
     }
 
     /**
