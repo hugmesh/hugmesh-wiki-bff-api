@@ -67,9 +67,6 @@ public interface WikiAttachmentDataRepository extends R2dbcRepository<WikiAttach
     Mono<WikiAttachment> findBySlugAndFilename(@Param("slug") String slug,
                                                @Param("filename") String filename);
 
-    /** Derived per-page delete (= {@code DELETE FROM wiki_attachment WHERE page_id = ?}); returns the deleted count. */
-    Mono<Long> deleteByPageId(String pageId);
-
     @Modifying
     @Query(DELETE_BY_SLUG_AND_FILENAME)
     Mono<Long> deleteBySlugFilenameAndDomain(@Param("slug") String slug,

@@ -736,6 +736,15 @@ for transparency rather than deleted from the history:
   `WikiAccessSingleBrandStampTest` (27 cases, both directions) and by
   `WikiBrandCatalogTest`'s agreement case, which drives the REAL `writeDomain` rather than
   restating the catalogue's own expression.
+- ~~**A SUPERADMIN page delete answered 204 while leaving the page behind — or removing
+  `default`'s same-slug page instead — after destroying the target's attachments.**~~
+  **Fixed (#15):** `WikiService.delete` resolves the page in the caller's scope and then
+  deletes **by that row's id** (`WikiPageRepository.deleteById`) instead of by slug+domain
+  (where a SUPERADMIN's `null` scope was coerced to `default`), so the statement can only
+  remove the row it resolved; the attachments go with it in the same statement via the
+  `wiki_attachment` FK `ON DELETE CASCADE` (nothing is deleted ahead of the page); a
+  zero-row delete is a **404**, never a 204; and the audit row is stamped with the brand
+  the page actually lived in.
 
 ## Roadmap / out of repo
 

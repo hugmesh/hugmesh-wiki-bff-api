@@ -154,14 +154,20 @@ public class WikiPageRepository {
     }
 
     /**
-     * Delete a page by slug WITHIN a brand; returns the count of deleted rows.
+     * Delete ONE page by its primary key and return the deleted-row count. The caller has
+     * ALREADY resolved the row in its own scope ({@link #findBySlug}), so this takes NO
+     * domain on purpose: the other write paths coerce an unscoped (SUPERADMIN) domain to
+     * {@code default}, and a delete that did the same would target the wrong brand's row
+     * after a cross-brand resolve — issue #15. Pinning the id means the statement can only
+     * ever remove the row that was resolved; the {@code wiki_attachment} FK
+     * ({@code ON DELETE CASCADE}, changelog 002) reaps its attachments in the same statement.
      *
-     * @param slug   the URL-stable page key to delete
-     * @param domain the brand/tenant to scope the delete to
-     * @return a {@link Mono} emitting the number of rows deleted (0 when not found, 1 on success)
+     * @param id the DB-generated UUID primary key of the page the caller resolved
+     * @return a {@link Mono} emitting the number of rows deleted — {@code 1}, or {@code 0} when
+     *         the row vanished between the resolve and the delete (the service maps that to
+     *         a 404, never a 204)
      */
-    public Mono<Long> deleteBySlugAndDomain(String slug, String domain) {
-        String dom = DomainScope.isUnscoped(domain) ? DomainRegistry.DEFAULT_DOMAIN : domain;
-        return data.deleteBySlugInDomain(slug, dom);
+    public Mono<Long> deleteById(String id) {
+        return data.deletePageById(id);
     }
 }

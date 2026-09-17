@@ -6,12 +6,14 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.r2dbc.test.autoconfigure.DataR2dbcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.jwt.Jwt;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.wikibff.security.PrincipalDomain;
@@ -39,6 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       leak); the audit trail is per-brand; SUPERADMIN reads across brands.</li>
  *   <li><b>CONCURRENT-CONFLICTING</b> — two racing updates at the same expectedVersion:
  *       exactly one succeeds, the other is a 409 stale-edit; the version bumps once.</li>
+ *   <li><b>DELETE SCOPING (issue #15)</b> — a SUPERADMIN delete removes exactly the row its
+ *       cross-brand resolve found (and that row's attachments, via the FK cascade), never a
+ *       same-slug row in {@code default} or any other brand, and audits in the page's own
+ *       brand; a scoped ADMIN still cannot reach another brand's page.</li>
  * </ul>
  */
 @DataR2dbcTest
@@ -49,6 +55,12 @@ class WikiServiceTest extends PostgresTestSupport {
     @Autowired WikiPageRepository pages;
     @Autowired WikiAuditLogRepository audit;
     @Autowired WikiAttachmentRepository attachments;
+    /** Raw handles for the delete tests: prove rows/attachments exist or not by PRIMARY KEY,
+     *  and plant a same-slug {@code default}-brand row with a chosen id. */
+    @Autowired WikiAttachmentDataRepository attachmentData;
+    /** Needed to build a REAL-repository subclass that reproduces the resolve/delete race. */
+    @Autowired WikiPageDataRepository pageData;
+    @Autowired DatabaseClient db;
 
     private WikiService service;
 
@@ -62,7 +74,7 @@ class WikiServiceTest extends PostgresTestSupport {
 
     @BeforeEach
     void setUp() {
-        service = new WikiService(pages, audit, new MarkdownRenderer(), new PrincipalDomain(MULTI), attachments);
+        service = new WikiService(pages, audit, new MarkdownRenderer(), new PrincipalDomain(MULTI));
     }
 
     /** A JWT principal for an issuer (brand) + subject + roles — the real shape the
@@ -200,6 +212,186 @@ class WikiServiceTest extends PostgresTestSupport {
             service.create(create(sx, "X page", "x"), adminX).block();
             // SUPERADMIN resolves the slug regardless of the authoring brand.
             assertThat(service.get(sx, su).block().title()).isEqualTo("X page");
+        }
+    }
+
+    // ── DELETE SCOPING (issue #15) — over the REAL store, so the FK cascade + the audit
+    //    stamp are exercised, not mocked ───────────────────────────────────────────────
+    @Nested
+    class DeleteScoping {
+
+        private final Authentication adminX = jwtAuth("https://id.brandx.example", "admin-x", "admin");
+        private final Authentication adminY = jwtAuth("https://id.brandy.example", "admin-y", "admin");
+        private final Authentication su = jwtAuth("https://id.brandx.example", "root", "superadmin");
+
+        private String attach(String pageId, String domain, String name) {
+            return attachments.insert(pageId, domain, name, "image/png", new byte[] {1, 2, 3}).block().id();
+        }
+
+        private void assertDeleteAuditedIn(String domain, String slug) {
+            assertThat(audit.list(domain).collectList().block())
+                    .as("wiki.page.delete for %s audited under %s", slug, domain)
+                    .anySatisfy(a -> {
+                        assertThat(a.action()).isEqualTo("wiki.page.delete");
+                        assertThat(a.target()).isEqualTo(slug);
+                    });
+        }
+
+        /** The issue's headline case: the page lives in a NON-default brand and NO default-brand
+         *  row shares its slug. The old delete ran {@code WHERE domain='default'}, removed 0 rows
+         *  and still completed as a success — with the attachments already destroyed. */
+        @Test
+        void superadmin_deletesNonDefaultBrandPage_pageAndAttachmentsGone_auditedInThatBrand() {
+            String s = slug("del-su-y");
+            WikiDto.Page page = service.create(create(s, "Y runbook", "y"), adminY).block();
+            String a1 = attach(page.id(), "brandy", "one.png");
+            String a2 = attach(page.id(), "brandy", "two.png");
+
+            service.delete(s, su).block();
+
+            assertThat(pages.findBySlug(s, "brandy").blockOptional()).as("the brand-Y page is gone").isEmpty();
+            assertThat(attachmentData.existsById(a1).block()).as("attachment 1 reaped by the FK cascade").isFalse();
+            assertThat(attachmentData.existsById(a2).block()).as("attachment 2 reaped by the FK cascade").isFalse();
+            assertDeleteAuditedIn("brandy", s);
+            assertThat(audit.list("default").collectList().block())
+                    .as("nothing about this page is audited under 'default'")
+                    .noneMatch(a -> s.equals(a.target()));
+        }
+
+        /** The collateral case from the issue thread: a {@code default}-brand row shares the
+         *  slug. It is planted with an id that sorts LAST, so the SUPERADMIN resolve (first by
+         *  id) deterministically picks the brand-Y row — the old code would then have deleted
+         *  the default row instead and reported success. */
+        @Test
+        void superadmin_sameSlugInDefault_deletesOnlyTheResolvedRow_defaultTwinSurvives() {
+            String s = slug("del-su-twin");
+            WikiDto.Page target = service.create(create(s, "Y page", "y"), adminY).block();
+            String targetAtt = attach(target.id(), "brandy", "y.png");
+            String twinId = "ffffffff-ffff-4fff-8fff-" + String.format("%012x", SEQ.incrementAndGet());
+            db.sql("INSERT INTO wiki_page (id, domain, slug, title, content_markdown, content_html, author_subject) "
+                            + "VALUES (:id, 'default', :slug, 'Default twin', 'd', '<p>d</p>', '@system')")
+                    .bind("id", twinId).bind("slug", s).fetch().rowsUpdated().block();
+            String twinAtt = attach(twinId, "default", "d.png");
+
+            // The cross-brand resolve the delete performs is deterministic here (target id < twin id).
+            assertThat(pages.findBySlug(s, null).block().id()).isEqualTo(target.id());
+
+            service.delete(s, su).block();
+
+            assertThat(pages.findById(target.id(), null).blockOptional()).as("the resolved brand-Y row is gone").isEmpty();
+            assertThat(attachmentData.existsById(targetAtt).block()).as("its attachment went with it").isFalse();
+            assertThat(pages.findById(twinId, null).blockOptional()).as("default's same-slug page is untouched").isPresent();
+            assertThat(attachmentData.existsById(twinAtt).block()).as("default's attachment is untouched").isTrue();
+            assertDeleteAuditedIn("brandy", s);
+            assertThat(audit.list("default").collectList().block()).noneMatch(a -> s.equals(a.target()));
+        }
+
+        /** Two brands share the slug: whichever row the cross-brand resolve picks is the ONLY
+         *  row removed, and the other keeps its attachment. */
+        @Test
+        void superadmin_sameSlugInTwoBrands_removesExactlyTheResolvedRow() {
+            String s = slug("del-su-pair");
+            WikiDto.Page px = service.create(create(s, "X", "x"), adminX).block();
+            WikiDto.Page py = service.create(create(s, "Y", "y"), adminY).block();
+            String ax = attach(px.id(), "brandx", "x.png");
+            String ay = attach(py.id(), "brandy", "y.png");
+            WikiPage resolved = pages.findBySlug(s, null).block();
+            boolean xResolved = resolved.id().equals(px.id());
+            String otherId = xResolved ? py.id() : px.id();
+            String resolvedAtt = xResolved ? ax : ay;
+            String otherAtt = xResolved ? ay : ax;
+
+            service.delete(s, su).block();
+
+            assertThat(pages.findById(resolved.id(), null).blockOptional()).as("the resolved row is gone").isEmpty();
+            assertThat(attachmentData.existsById(resolvedAtt).block()).isFalse();
+            assertThat(pages.findById(otherId, null).blockOptional()).as("the other brand's row survives").isPresent();
+            assertThat(attachmentData.existsById(otherAtt).block()).as("with its attachment").isTrue();
+            assertDeleteAuditedIn(resolved.domain(), s);
+        }
+
+        /** A scoped ADMIN still cannot reach another brand's page through delete: 404, and
+         *  neither the page nor its attachment is touched. */
+        @Test
+        void brandXAdmin_cannotDeleteBrandYPage_404_nothingRemoved() {
+            String s = slug("del-x-vs-y");
+            WikiDto.Page py = service.create(create(s, "Y only", "y"), adminY).block();
+            String ay = attach(py.id(), "brandy", "y.png");
+
+            StepVerifier.create(service.delete(s, adminX))
+                    .expectErrorSatisfies(e -> assertThat(((ApiException) e).status().value()).isEqualTo(404))
+                    .verify();
+
+            assertThat(pages.findById(py.id(), null).blockOptional()).isPresent();
+            assertThat(attachmentData.existsById(ay).block()).isTrue();
+        }
+
+        /**
+         * The REPOSITORY half of the zero-row branch, against the REAL database. The service's
+         * "0 rows ⇒ 404, never 204" guard is built on {@code filter(deleted -> deleted > 0)},
+         * so it depends entirely on what Spring Data R2DBC's {@code @Modifying Mono<Long>}
+         * emits when the DELETE matches no row — which no test proved. MEASURED here against
+         * Postgres: it emits {@code 0L}, it does NOT complete empty.
+         *
+         * <p>An unrelated page and its attachment are planted first, so this also pins that
+         * the id-pinned statement touches nothing else. The SERVICE half — that a vanished
+         * row really does surface as a 404 rather than a silent 204 — is
+         * {@link #serviceDelete_rowVanishesBetweenResolveAndDelete_realDb_is404_neverSilent204()}.
+         */
+        @Test
+        void deleteById_idMatchesNoRow_realDbZeroRowContract_andDestroysNothing() {
+            String s = slug("del-zero-row");
+            WikiDto.Page survivor = service.create(create(s, "Survivor", "y"), adminY).block();
+            String survivorAtt = attach(survivor.id(), "brandy", "keep.png");
+            String absentId = "aaaaaaaa-aaaa-4aaa-8aaa-" + String.format("%012x", SEQ.incrementAndGet());
+
+            StepVerifier.create(pages.deleteById(absentId))
+                    .expectNext(0L)
+                    .as("a DELETE matching no row emits the count 0 — not an empty Mono, "
+                            + "and never a value the > 0 filter would let through")
+                    .verifyComplete();
+
+            assertThat(pages.findById(survivor.id(), null).blockOptional())
+                    .as("the unrelated page survives a no-match delete").isPresent();
+            assertThat(attachmentData.existsById(survivorAtt).block())
+                    .as("and so does its attachment — nothing is destroyed ahead of the page").isTrue();
+        }
+
+        /**
+         * The SERVICE half of the zero-row branch, against the REAL database and with NO mocks.
+         * The race the guard exists for — the resolved row vanishing before the DELETE runs — is
+         * reproduced deterministically by a REAL {@link WikiPageRepository} subclass whose
+         * {@code findBySlug} removes the row it just resolved. The delete then matches nothing.
+         *
+         * <p>Without the guard this is the exact defect of issue #15's second half: a 204 for a
+         * delete that removed nothing. With it, a 404 — and NOTHING is audited, because a page
+         * that was never deleted must not leave a {@code wiki.page.delete} trail.
+         */
+        @Test
+        void serviceDelete_rowVanishesBetweenResolveAndDelete_realDb_is404_neverSilent204() {
+            String s = slug("del-vanish");
+            service.create(create(s, "Vanishing", "y"), adminY).block();
+
+            WikiPageRepository vanishing = new WikiPageRepository(pageData) {
+                @Override
+                public Mono<WikiPage> findBySlug(String slug, String domain) {
+                    return super.findBySlug(slug, domain)
+                            .flatMap(p -> db.sql("DELETE FROM wiki_page WHERE id = :id")
+                                    .bind("id", p.id()).fetch().rowsUpdated().thenReturn(p));
+                }
+            };
+            WikiService racing = new WikiService(
+                    vanishing, audit, new MarkdownRenderer(), new PrincipalDomain(MULTI));
+
+            StepVerifier.create(racing.delete(s, su))
+                    .expectErrorSatisfies(e -> assertThat(((ApiException) e).status().value())
+                            .as("a delete that removed no row is a 404, never a silent 204")
+                            .isEqualTo(404))
+                    .verify();
+
+            assertThat(audit.list("brandy").collectList().block())
+                    .as("nothing is audited for a delete that removed nothing")
+                    .noneMatch(a -> s.equals(a.target()) && "wiki.page.delete".equals(a.action()));
         }
     }
 

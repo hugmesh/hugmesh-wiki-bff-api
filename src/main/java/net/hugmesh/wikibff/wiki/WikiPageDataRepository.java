@@ -64,9 +64,11 @@ public interface WikiPageDataRepository extends R2dbcRepository<WikiPage, String
             UPDATE wiki_page SET is_published = true, published_at = now() \
             WHERE slug = :slug AND domain = :domain""";
 
-    /** Delete a page by slug within a brand. */
-    String DELETE_BY_SLUG_AND_DOMAIN =
-            "DELETE FROM wiki_page WHERE slug = :slug AND domain = :domain";
+    /** Delete ONE page by its primary key — the row the service already resolved in the
+     *  caller's scope. Deliberately carries NO domain predicate: the scope was applied at the
+     *  resolve, and pinning the id is what makes it impossible to hit a row in a brand the
+     *  caller did not name (issue #15). */
+    String DELETE_BY_ID = "DELETE FROM wiki_page WHERE id = :id";
 
     /** The DB-generated-id INSERT — always yields the database-minted id (plain
      *  {@code @Query}, NOT {@code @Modifying}: {@code RETURNING id} reads the new id back). */
@@ -87,7 +89,10 @@ public interface WikiPageDataRepository extends R2dbcRepository<WikiPage, String
     @Query(PUBLISH_BY_SLUG)
     Mono<Long> publishBySlugInDomain(@Param("slug") String slug, @Param("domain") String domain);
 
+    /** Declared (not derived) so the deleted-row COUNT comes back: the inherited
+     *  {@code deleteById} is {@code Mono<Void>} and cannot tell "removed" from "matched
+     *  nothing", and the service must answer 404 — never 204 — for the latter. */
     @Modifying
-    @Query(DELETE_BY_SLUG_AND_DOMAIN)
-    Mono<Long> deleteBySlugInDomain(@Param("slug") String slug, @Param("domain") String domain);
+    @Query(DELETE_BY_ID)
+    Mono<Long> deletePageById(@Param("id") String id);
 }

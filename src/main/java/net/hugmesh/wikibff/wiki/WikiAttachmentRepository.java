@@ -66,19 +66,6 @@ public class WikiAttachmentRepository {
     // ── writes ─────────────────────────────────────────────────────────
 
     /**
-     * Delete all attachments belonging to a page (cascade helper — called when a page
-     * is deleted so the audit trail can reflect the count). Returns the number of rows
-     * deleted. The DB FK ON DELETE CASCADE also covers this, but an explicit delete
-     * here lets the service audit the count.
-     *
-     * @param pageId the UUID primary key of the owning wiki page
-     * @return a {@link Mono} emitting the number of rows deleted (zero or more)
-     */
-    public Mono<Long> deleteByPageId(String pageId) {
-        return data.deleteByPageId(pageId);
-    }
-
-    /**
      * Delete a single attachment identified by page slug + filename WITHIN a brand.
      * Uses a subquery to locate the attachment id via a join to {@code wiki_page}.
      * Returns the number of deleted rows (0 = not found).
