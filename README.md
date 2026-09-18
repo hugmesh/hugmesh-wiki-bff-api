@@ -46,6 +46,14 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
   `WikiAccessGuard` overlay decision (see below).
 - **Data access** is Spring Data R2DBC reactive repositories (no raw SQL strings / inline
   `@Query`), per the platform's data-access convention.
+- **DEPLOYING OR TURNING MULTI-BRAND ON? Read the
+  [cut-over runbook](#cut-over-set-app_tenancy_issuers-and-redeploy--the-re-stamp-derives-its-own-target)
+  first — it is TWO environment variables, not one.** `APP_TENANCY_ISSUERS` performs the
+  cut-over; `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` is a **permanent pin**
+  that must be set afterwards and never removed, because from the armed boot onwards a boot
+  that publishes no parameter fails startup on a checksum error that does not name the
+  config change (decision 31, operator 2026-09-17). Leaving `APP_TENANCY_ISSUERS` unset is
+  a supported, deliberate state, not an unfinished one (decision 30, same date).
 - **CI runs on GitLab.** The GitHub repo is pull-mirrored into the platform's in-cluster
   GitLab instance, which runs the pipeline described in
   [CI / security pipeline](#ci--security-pipeline). Deployments run SELinux-enforcing, use
@@ -346,6 +354,25 @@ its own tokens, and any token with an unknown `iss` claim is rejected with **401
 > ```
 > Leave the variable unset for a single-brand deployment.
 
+> **DECISION 30, operator 2026-09-17: HOLD opt-in.** `app.tenancy.issuers` keeps its empty
+> default (`application.yml:123`, `"${APP_TENANCY_ISSUERS:}"`) and is **not** defaulted to
+> `${CASDOOR_ISSUER_URI}=hugmesh`. This is a deliberate hold, revisit-after-the-current-push
+> — **not an oversight**, and not a TODO for the next agent to tidy up. The one-line
+> alternative was written up in full on hugmesh-wiki-bff-api#19 and declined there, because
+> defaulting it makes the platform brand live for **every** deployment with no variable set
+> and changes two behaviours nobody asked for: `isKnownDomain("hugmesh")` becomes true where
+> `isKnownDomain("default")` was false (a SUPERADMIN could then target the platform brand for
+> a cross-brand ban), and the stamped authority becomes `DOMAIN_hugmesh` instead of
+> `DOMAIN_default`.
+>
+> **Reverting it is caught.** `UnarmedRestampBootTest` boots with the shipped defaults —
+> `application-test.yml` sets no `app.tenancy.issuers`, so the test reads this exact line —
+> and asserts that no re-stamp target is published and that 007 stays `PENDING`. Measured
+> 2026-09-17: defaulting the property to `${CASDOOR_ISSUER_URI:...}=hugmesh` turns that class
+> from `Tests run: 3, Failures: 0` into `Tests run: 3, Failures: 2`
+> (`expected: null but was: "hugmesh"`, and the changeset recorded as run). Do not "fix" that
+> test; it is the pin.
+
 ### Cut-over: set `APP_TENANCY_ISSUERS` and redeploy — the re-stamp derives its own target
 
 Turning multi-brand on is **not** a config-only change on a cluster that already holds
@@ -369,9 +396,26 @@ one transaction — and since issue #19 it **works out the brand for itself**. Y
 type it.
 
 ```sh
-# The whole cut-over. One step.
+# THE CUT-OVER, IN FULL. Two environment variables, in this order.
+#
+# 1. The armed boot. This alone re-stamps the data and brings the wiki up
+#    under the brand. Deploy it and WAIT FOR THE POD TO BE READY.
 APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
+
+# 2. THE PERMANENT PIN. Set it once the armed boot has SUCCEEDED, to the brand
+#    the armed boot logged, and NEVER REMOVE IT. It is not belt-and-braces: from
+#    the armed boot onwards it is load-bearing for STARTUP. See "After the
+#    cut-over ... pin the brand" below for what happens without it.
+SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=brand-a
 ```
+
+> **Step 2 is not optional and it is not cleanup.** `APP_TENANCY_ISSUERS` alone is enough
+> to *perform* the cut-over, which is why step 1 stands on its own — but from the moment
+> the armed boot succeeds, any later boot that publishes **no** parameter (the variable
+> emptied, a reverted manifest, ArgoCD `selfHeal`, or a **second brand added** — the
+> documented growth path) dies in `ValidationFailedException` naming a **checksum**.
+> The pin is what makes those boots safe. **DECISION 31, operator 2026-09-17: confirmed
+> and permanent** — see the decision record below.
 
 `RestampTargetEnvironmentPostProcessor` reads that mapping through a real `DomainRegistry`
 before Liquibase binds its parameters, and publishes the brand as
@@ -379,9 +423,12 @@ before Liquibase binds its parameters, and publishes the brand as
 completes **before the application serves its first request** under the new brand, in the
 same boot that configures it. There is no window between the two and nothing to sequence.
 
-> **This replaces the old two-step procedure.** Earlier revisions of this README told you
-> to run the migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an
-> un-armed run publishes no target and migrates nothing.
+> **This replaces the old two-step procedure** — a *different* two steps, do not confuse
+> them with the two variables above. Earlier revisions of this README told you to run the
+> migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an un-armed run
+> publishes no target and migrates nothing. The migration and the configuration move
+> together, in one boot; the pin in step 2 is what you set **after** that boot has
+> succeeded, and it migrates nothing by itself.
 
 It arms **only** when the mapping holds exactly one pair, **and that pair names the issuer
 this resource server trusts** (`CASDOOR_ISSUER_URI`):
@@ -463,7 +510,32 @@ Nothing is migrated and nothing is lost, but the error names a checksum, not the
 change, so it does not look like what it is. Measured in
 `DerivedTargetRerunTest.unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned`.
 
-> **So make the cut-over two env vars, not one.** Once the armed boot has succeeded, set
+**How strong that evidence actually is — read this before you plan around it.** The word
+"crashloops" is an *inference*, not an observation. **No real pod has ever booted any of
+this.** `DerivedTargetRerunTest` says so itself (`DerivedTargetRerunTest.java:39-41`): it
+drives `Liquibase.update()` directly against a Testcontainers Postgres, exactly as
+`DefaultDomainRestampChangesetTest` does, and is deliberately **not** a `@SpringBootTest`.
+So what is measured is that **`liquibase.update` throws `ValidationFailedException` and
+migrates nothing**; that this becomes a crashlooping pod is the ordinary consequence of
+Liquibase running during context refresh, and it is reasoned, not seen. What follows from
+that, honestly:
+
+* The failure mode and the remedy are **real and pinned** — re-run the test and it fails
+  the moment either is removed. Measured 2026-09-17: adding `<validCheckSum>ANY</validCheckSum>`
+  to the `007-restamp-default-domain-to-brand` changeSet (the "obvious fix" for a checksum
+  error) turns `Tests run: 4, Failures: 0` into `Tests run: 4, Failures: 2`.
+* What **nobody** has confirmed is the operational shape on a cluster: the exact pod
+  message, whether the readiness probe or `CrashLoopBackOff` is what an operator sees
+  first, and how ArgoCD reports it. Budget for reading the pod log, not for recognising a
+  symptom from this README.
+* `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` has **still never been exercised
+  as a real environment variable** — only the Spring property form is covered by tests. It
+  is now also the documented permanent pin, so it is the single most valuable thing to
+  verify on the first real deployment.
+
+> **So make the cut-over two env vars, not one** — step 2 of the runbook above.
+> **DECISION 31, operator 2026-09-17: the pin is CONFIRMED and permanent.** Once the armed
+> boot has succeeded, set
 > `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand>` **permanently** and leave
 > it there. The explicit override wins on every later boot regardless of what the derivation
 > says, so `APP_TENANCY_ISSUERS` goes back to being an ordinary scoping knob. If you are
