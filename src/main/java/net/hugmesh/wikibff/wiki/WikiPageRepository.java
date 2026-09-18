@@ -21,7 +21,7 @@ import net.hugmesh.commons.tenancy.DomainScope;
  * (the un-pinned finders). The {@code (domain, slug)} pair is UNIQUE, so a slug may exist
  * independently per brand.
  *
- * <p><b>Optimistic concurrency.</b> {@link #updateBySlug} bumps {@code version} and guards
+ * <p><b>Optimistic concurrency.</b> {@link #updateById} bumps {@code version} and guards
  * on {@code version = :expected}, so a concurrent/stale edit updates ZERO rows (the service
  * maps that to a 409). The atomic conditional UPDATE is the concurrent-edit serialization
  * point.
@@ -107,59 +107,68 @@ public class WikiPageRepository {
     }
 
     /**
-     * Conditionally update a page by slug WITHIN a brand, bumping {@code version} —
-     * guarded on {@code version = :expected} for optimistic concurrency. Returns the new
-     * row on success, or {@link Mono#empty()} when NO row matched (slug missing in the
-     * brand OR a stale {@code expectedVersion}). The atomic conditional UPDATE is the
-     * concurrent-edit serialization point: exactly one of two racing writers at the same
-     * expected version wins; the loser updates zero rows. The {@code authorSubject} is
-     * re-stamped to the editing principal (server-side).
+     * Conditionally update ONE page by its primary key, bumping {@code version} — guarded
+     * on {@code version = :expected} for optimistic concurrency. The update-path
+     * counterpart to {@link #deleteById} (issue #15's pattern; applied here for decision
+     * 59 / issue #33). The caller has ALREADY resolved the row in its own scope
+     * ({@link #findBySlug}), so this takes NO domain on purpose: the other write paths
+     * used to coerce an unscoped (SUPERADMIN) domain to {@code default}, and an update that
+     * did the same would silently miss the resolved row after a cross-brand resolve —
+     * matching zero rows and reporting a self-contradicting 409 (the row IS at the
+     * expected version, just in the wrong — coerced — brand). Pinning the id means the
+     * statement can only ever touch the row that was resolved.
      *
-     * @param slug            the URL-stable page key within {@code domain}
+     * <p>Returns the updated row, or {@link Mono#empty()} when NO row matched (the id
+     * vanished between the resolve and the update, OR a genuinely stale
+     * {@code expectedVersion}). The atomic conditional UPDATE is the concurrent-edit
+     * serialization point: exactly one of two racing writers at the same expected version
+     * wins; the loser updates zero rows. The {@code authorSubject} is re-stamped to the
+     * editing principal (server-side).
+     *
+     * @param id              the DB-generated UUID primary key of the page the caller resolved
      * @param title           the new page title
      * @param contentMarkdown the new markdown edit source
      * @param contentHtml     the new rendered HTML snapshot (computed by the service before calling this)
      * @param authorSubject   the Casdoor {@code sub} of the editing principal (server-derived)
      * @param expectedVersion the version the caller last read; the UPDATE is a no-op when
      *                        this differs from the stored version
-     * @param domain          the brand/tenant to scope the update to
      * @return a {@link Mono} emitting the updated {@link WikiPage}, or {@link Mono#empty()}
-     *         when the slug is missing in the brand or {@code expectedVersion} is stale
+     *         when the id is gone or {@code expectedVersion} is stale
      */
-    public Mono<WikiPage> updateBySlug(String slug, String title, String contentMarkdown,
-                                       String contentHtml, String authorSubject,
-                                       long expectedVersion, String domain) {
-        String dom = DomainScope.isUnscoped(domain) ? DomainRegistry.DEFAULT_DOMAIN : domain;
-        return data.updateBySlugGuarded(slug, title, contentMarkdown, contentHtml, authorSubject,
-                        expectedVersion, dom)
-                .flatMap(updated -> updated > 0 ? findBySlug(slug, dom) : Mono.empty());
+    public Mono<WikiPage> updateById(String id, String title, String contentMarkdown,
+                                     String contentHtml, String authorSubject,
+                                     long expectedVersion) {
+        return data.updateByIdGuarded(id, title, contentMarkdown, contentHtml, authorSubject, expectedVersion)
+                .flatMap(updated -> updated > 0 ? findById(id, null) : Mono.empty());
     }
 
     /**
-     * Mark a page as published (sets {@code is_published=true, published_at=now()})
-     * WITHIN a brand. Returns the updated row, or {@link Mono#empty()} when the slug
-     * does not exist in the brand. The ZIM trigger uses {@code published_at} to detect
-     * pages that have been republished since the last build.
+     * Mark ONE page as published (sets {@code is_published=true, published_at=now()}) by
+     * its primary key. The publish-path counterpart to {@link #deleteById} (issue #15's
+     * pattern; applied here for decision 59 / issue #33) — no domain predicate, for the
+     * same reason as {@link #updateById}: the caller has already resolved the row in its
+     * own scope, and pinning the id makes it structurally impossible to publish a
+     * same-slug row in the wrong brand.
      *
-     * @param slug   the URL-stable page key within {@code domain}
-     * @param domain the brand/tenant to scope the publish to
+     * @param id the DB-generated UUID primary key of the page the caller resolved
      * @return a {@link Mono} emitting the updated {@link WikiPage} (with
      *         {@code published=true} and {@code publishedAt} set), or {@link Mono#empty()}
-     *         when the slug is not found in the brand
+     *         when the id is gone (the resolved row vanished concurrently)
      */
-    public Mono<WikiPage> publishBySlug(String slug, String domain) {
-        String dom = DomainScope.isUnscoped(domain) ? DomainRegistry.DEFAULT_DOMAIN : domain;
-        return data.publishBySlugInDomain(slug, dom)
-                .flatMap(updated -> updated > 0 ? findBySlug(slug, dom) : Mono.empty());
+    public Mono<WikiPage> publishById(String id) {
+        return data.publishById(id)
+                .flatMap(updated -> updated > 0 ? findById(id, null) : Mono.empty());
     }
 
     /**
      * Delete ONE page by its primary key and return the deleted-row count. The caller has
      * ALREADY resolved the row in its own scope ({@link #findBySlug}), so this takes NO
-     * domain on purpose: the other write paths coerce an unscoped (SUPERADMIN) domain to
-     * {@code default}, and a delete that did the same would target the wrong brand's row
-     * after a cross-brand resolve — issue #15. Pinning the id means the statement can only
-     * ever remove the row that was resolved; the {@code wiki_attachment} FK
+     * domain on purpose: {@link #create} still coerces an unscoped (SUPERADMIN) domain to
+     * {@code default} (a create has no existing row to resolve, so there is nothing to
+     * pin), and a delete that did the same would target the wrong brand's row after a
+     * cross-brand resolve — issue #15. {@link #updateById}/{@link #publishById} follow the
+     * same id-pinned pattern (issue #33 / decision 59). Pinning the id means the statement
+     * can only ever remove the row that was resolved; the {@code wiki_attachment} FK
      * ({@code ON DELETE CASCADE}, changelog 002) reaps its attachments in the same statement.
      *
      * @param id the DB-generated UUID primary key of the page the caller resolved
