@@ -39,20 +39,24 @@ public final class WikiDto {
      * ever sees more than their own brand's rows here. Additive to the response body, so
      * existing consumers that ignore unknown fields are unaffected.
      *
-     * <p><b>What this field DOES NOT fix, and now makes visible.</b> The value is always the
-     * row's true brand, so the list itself does not lie. But {@code WikiPageRepository}
-     * still coerces a SUPERADMIN's {@code null} scope to
-     * {@link net.hugmesh.commons.security.DomainRegistry#DEFAULT_DOMAIN} on create, update
-     * and publish (issue #15 pinned only the DELETE to the resolved row's id). So for a page
-     * this list shows a SUPERADMIN under a NON-default brand, the read paths resolve it
-     * cross-brand while the write paths silently retarget {@code default}: measured on a
-     * brandy-only page at version 1, {@code GET} succeeds, {@code PUT} with the correct
-     * {@code expectedVersion} of 1 answers {@code 409 "stale edit: page is at version 1, not
-     * 1"} (the secondary read that builds that message IS cross-brand, which is why it
-     * contradicts itself), and {@code POST /publish} answers 404 for a page the same caller
-     * can GET. Surfacing the brand is what lets an operator see that the row they are acting
-     * on is not in {@code default}; the write-path coercion is a separate, un-decided fix
-     * (the #21 / operator-decision-26 single-brand stamp landed on the ACCESS surface only).
+     * <p><b>What this field made visible, and what has since been fixed.</b> The value is
+     * always the row's true brand, so the list itself never lied. It DID surface a real
+     * write-path bug: {@code WikiPageRepository} used to coerce a SUPERADMIN's {@code null}
+     * scope to {@link net.hugmesh.commons.security.DomainRegistry#DEFAULT_DOMAIN} on
+     * create, update and publish (issue #15 pinned only DELETE to the resolved row's id at
+     * the time). Measured on a brandy-only page at version 1: {@code GET} succeeded, but
+     * {@code PUT} with the correct {@code expectedVersion} of 1 answered a
+     * self-contradicting {@code 409 "stale edit: page is at version 1, not 1"} (the
+     * secondary read that built that message was ITSELF cross-brand), and
+     * {@code POST /publish} answered 404 for a page the same caller could GET.
+     *
+     * <p>Operator decision 59 (2026-09-18, issue #33): <b>pin writes to the resolved row's
+     * id</b>, the same fix #15 applied to delete. {@code update}/{@code publish} now
+     * resolve the page in the caller's scope and act on that row's id — never
+     * slug+domain — so a SUPERADMIN reaches the same row for every verb. {@code create} is
+     * unaffected by this decision: a create has no existing row to resolve, so defaulting
+     * a brand-less SUPERADMIN create to {@code default} remains the deliberate design (the
+     * #21 / operator-decision-26 single-brand stamp is the ACCESS-surface analogue).
      *
      * @param id            the DB-generated UUID primary key (changelog 006)
      * @param domain        the brand/tenant the page belongs to (server-derived; the row's

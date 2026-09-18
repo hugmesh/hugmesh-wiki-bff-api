@@ -53,16 +53,22 @@ public interface WikiPageDataRepository extends R2dbcRepository<WikiPage, String
             VALUES (:domain, :slug, :title, :md, :html, :author, 1, now(), now()) \
             RETURNING id""";
 
-    /** Optimistic-concurrency UPDATE guarded on {@code version = :expected}; bumps version + stamps {@code updated_at}. */
-    String UPDATE_BY_SLUG = """
+    /** Optimistic-concurrency UPDATE guarded on {@code version = :expected}, pinned to the
+     *  primary key — the row the service already resolved in the caller's scope. Deliberately
+     *  carries NO domain predicate, the same reasoning as {@link #DELETE_BY_ID} (issue #15 /
+     *  #33 / decision 59): the scope was applied at the resolve, and pinning the id is what
+     *  makes it impossible to update a row in a brand the caller did not name. Bumps version +
+     *  stamps {@code updated_at}. */
+    String UPDATE_BY_ID = """
             UPDATE wiki_page SET title = :title, content_markdown = :md, content_html = :html, \
             author_subject = :author, version = version + 1, updated_at = now() \
-            WHERE slug = :slug AND domain = :domain AND version = :expected""";
+            WHERE id = :id AND version = :expected""";
 
-    /** Mark a page published (set {@code is_published = true, published_at = now()}) within a brand. */
-    String PUBLISH_BY_SLUG = """
+    /** Mark a page published (set {@code is_published = true, published_at = now()}) by its
+     *  primary key — same no-domain-predicate reasoning as {@link #UPDATE_BY_ID}. */
+    String PUBLISH_BY_ID = """
             UPDATE wiki_page SET is_published = true, published_at = now() \
-            WHERE slug = :slug AND domain = :domain""";
+            WHERE id = :id""";
 
     /** Delete ONE page by its primary key — the row the service already resolved in the
      *  caller's scope. Deliberately carries NO domain predicate: the scope was applied at the
@@ -78,16 +84,19 @@ public interface WikiPageDataRepository extends R2dbcRepository<WikiPage, String
                             @Param("md") String contentMarkdown, @Param("html") String contentHtml,
                             @Param("author") String authorSubject);
 
+    /** Declared (not derived) so the updated-row COUNT comes back: {@code Mono<Long>} lets the
+     *  repository distinguish "0 rows" (vanished id or stale {@code expectedVersion}) from a
+     *  real update, which an inherited derived method cannot express. */
     @Modifying
-    @Query(UPDATE_BY_SLUG)
-    Mono<Long> updateBySlugGuarded(@Param("slug") String slug, @Param("title") String title,
-                                   @Param("md") String contentMarkdown, @Param("html") String contentHtml,
-                                   @Param("author") String authorSubject,
-                                   @Param("expected") long expectedVersion, @Param("domain") String domain);
+    @Query(UPDATE_BY_ID)
+    Mono<Long> updateByIdGuarded(@Param("id") String id, @Param("title") String title,
+                                 @Param("md") String contentMarkdown, @Param("html") String contentHtml,
+                                 @Param("author") String authorSubject,
+                                 @Param("expected") long expectedVersion);
 
     @Modifying
-    @Query(PUBLISH_BY_SLUG)
-    Mono<Long> publishBySlugInDomain(@Param("slug") String slug, @Param("domain") String domain);
+    @Query(PUBLISH_BY_ID)
+    Mono<Long> publishById(@Param("id") String id);
 
     /** Declared (not derived) so the deleted-row COUNT comes back: the inherited
      *  {@code deleteById} is {@code Mono<Void>} and cannot tell "removed" from "matched
