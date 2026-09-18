@@ -24,7 +24,41 @@ public final class WikiDto {
      * A page summary (the list view — omits the heavy content columns
      * {@code contentMarkdown} and {@code contentHtml}).
      *
+     * <p><b>The {@code domain} is load-bearing here, not decoration (issue #17).</b> This is
+     * the row shape of {@code GET /bff/wiki/pages}, and that list is CROSS-BRAND for a
+     * SUPERADMIN — {@code WikiPageRepository#list(null)} returns every brand's pages in one
+     * response. Liquibase {@code 001} makes {@code (domain, slug)} UNIQUE, so the same slug
+     * legitimately exists once per brand; without the brand on the row, two such rows are
+     * distinguishable only by the opaque {@code id} or by a title that happens to differ,
+     * and an operator acting on one of them (the console's per-row delete) cannot see which
+     * brand they are aiming at. The value is the row's OWN stored {@code domain}, so it is
+     * the brand the row actually lives in — never a re-derivation of the caller's scope.
+     *
+     * <p>No new disclosure: the same caller is already served this value on the single-page
+     * read ({@link Page#domain()}) of any page this list shows them, and only a SUPERADMIN
+     * ever sees more than their own brand's rows here. Additive to the response body, so
+     * existing consumers that ignore unknown fields are unaffected.
+     *
+     * <p><b>What this field DOES NOT fix, and now makes visible.</b> The value is always the
+     * row's true brand, so the list itself does not lie. But {@code WikiPageRepository}
+     * still coerces a SUPERADMIN's {@code null} scope to
+     * {@link net.hugmesh.commons.security.DomainRegistry#DEFAULT_DOMAIN} on create, update
+     * and publish (issue #15 pinned only the DELETE to the resolved row's id). So for a page
+     * this list shows a SUPERADMIN under a NON-default brand, the read paths resolve it
+     * cross-brand while the write paths silently retarget {@code default}: measured on a
+     * brandy-only page at version 1, {@code GET} succeeds, {@code PUT} with the correct
+     * {@code expectedVersion} of 1 answers {@code 409 "stale edit: page is at version 1, not
+     * 1"} (the secondary read that builds that message IS cross-brand, which is why it
+     * contradicts itself), and {@code POST /publish} answers 404 for a page the same caller
+     * can GET. Surfacing the brand is what lets an operator see that the row they are acting
+     * on is not in {@code default}; the write-path coercion is a separate, un-decided fix
+     * (the #21 / operator-decision-26 single-brand stamp landed on the ACCESS surface only).
+     *
      * @param id            the DB-generated UUID primary key (changelog 006)
+     * @param domain        the brand/tenant the page belongs to (server-derived; the row's
+     *                      own stored value). The list is cross-brand for a SUPERADMIN and
+     *                      {@code (domain, slug)} is UNIQUE, so this is what tells two
+     *                      same-slug rows apart — see {@link Page#domain()}
      * @param slug          the URL-stable page key within the brand
      * @param title         the page title
      * @param authorSubject the Casdoor {@code sub} of the last author (server-derived)
@@ -32,8 +66,8 @@ public final class WikiDto {
      * @param updatedAt     the timestamp of the most recent write
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public record PageSummary(String id, String slug, String title, String authorSubject,
-                              long version, Instant updatedAt) {
+    public record PageSummary(String id, String domain, String slug, String title,
+                              String authorSubject, long version, Instant updatedAt) {
         /**
          * Construct a {@link PageSummary} from a {@link WikiPage} row (omitting content columns).
          *
@@ -41,7 +75,7 @@ public final class WikiDto {
          * @return a {@link PageSummary} populated from {@code p}
          */
         public static PageSummary of(WikiPage p) {
-            return new PageSummary(p.id(), p.slug(), p.title(), p.authorSubject(),
+            return new PageSummary(p.id(), p.domain(), p.slug(), p.title(), p.authorSubject(),
                     p.version(), p.updatedAt());
         }
     }
@@ -88,8 +122,10 @@ public final class WikiDto {
     /**
      * The page-list response wrapper.
      *
-     * @param pages the ordered list of {@link PageSummary} records for the caller's brand
-     *              (newest-updated first)
+     * @param pages the ordered list of {@link PageSummary} records the caller may read,
+     *              newest-updated first — a scoped ADMIN's own brand only, EVERY brand for a
+     *              SUPERADMIN, in which case {@link PageSummary#domain()} is what says which
+     *              brand each row belongs to (issue #17)
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record PageList(List<PageSummary> pages) {
