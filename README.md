@@ -24,6 +24,14 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
 
 ## Current State
 
+- **DEPLOYING OR TURNING MULTI-BRAND ON? Read the
+  [cut-over runbook](#cut-over-set-app_tenancy_issuers-and-redeploy--the-re-stamp-derives-its-own-target)
+  first — it is TWO environment variables, not one.** `APP_TENANCY_ISSUERS` performs the
+  cut-over; `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` is a **permanent pin**
+  that must be set afterwards and never removed, because from the armed boot onwards a boot
+  that publishes no parameter fails startup on a checksum error that does not name the
+  config change (decision 31, operator 2026-09-17). Leaving `APP_TENANCY_ISSUERS` unset is
+  a supported, deliberate state, not an unfinished one (decision 30, same date).
 - **Dependency baseline:** Spring Boot **4.0.7** / Spring Cloud **2025.1.2**, **Java 25
   LTS** (`eclipse-temurin:25`), on the shared Maven artifacts
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
@@ -46,14 +54,6 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
   `WikiAccessGuard` overlay decision (see below).
 - **Data access** is Spring Data R2DBC reactive repositories (no raw SQL strings / inline
   `@Query`), per the platform's data-access convention.
-- **DEPLOYING OR TURNING MULTI-BRAND ON? Read the
-  [cut-over runbook](#cut-over-set-app_tenancy_issuers-and-redeploy--the-re-stamp-derives-its-own-target)
-  first — it is TWO environment variables, not one.** `APP_TENANCY_ISSUERS` performs the
-  cut-over; `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` is a **permanent pin**
-  that must be set afterwards and never removed, because from the armed boot onwards a boot
-  that publishes no parameter fails startup on a checksum error that does not name the
-  config change (decision 31, operator 2026-09-17). Leaving `APP_TENANCY_ISSUERS` unset is
-  a supported, deliberate state, not an unfinished one (decision 30, same date).
 - **CI runs on GitLab.** The GitHub repo is pull-mirrored into the platform's in-cluster
   GitLab instance, which runs the pipeline described in
   [CI / security pipeline](#ci--security-pipeline). Deployments run SELinux-enforcing, use
@@ -395,19 +395,46 @@ domain-bearing tables (`wiki_page`, `wiki_attachment`, `wiki_audit_log`, `wiki_a
 one transaction — and since issue #19 it **works out the brand for itself**. You do not
 type it.
 
-```sh
-# THE CUT-OVER, IN FULL. Two environment variables, in this order.
-#
-# 1. The armed boot. This alone re-stamps the data and brings the wiki up
-#    under the brand. Deploy it and WAIT FOR THE POD TO BE READY.
-APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
+**The cut-over is TWO environment variables and TWO boots.** They are written as two
+blocks on purpose — pasting both into the same deployment is the one way to corrupt the
+data this procedure exists to protect (see the warning under step 2).
 
-# 2. THE PERMANENT PIN. Set it once the armed boot has SUCCEEDED, to the brand
-#    the armed boot logged, and NEVER REMOVE IT. It is not belt-and-braces: from
-#    the armed boot onwards it is load-bearing for STARTUP. See "After the
-#    cut-over ... pin the brand" below for what happens without it.
+**Step 1 of 2 — the armed boot.** This alone re-stamps the data and brings the wiki up
+under the brand.
+
+```sh
+APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
+```
+
+Deploy it and **wait for the pod to be ready**. The boot log records the brand it derived
+and armed, verbatim:
+
+```
+wiki-bff 007: launch domain derived as 'brand-a' (...) — ... Arming the cut-over re-stamp:
+any domain='default' row in wiki_page, wiki_attachment, wiki_audit_log and wiki_access
+will be moved to 'brand-a' before this application serves.
+```
+
+**Step 2 of 2 — the permanent pin.** Add it to the *same* deployment **after step 1 has
+succeeded**, set to the brand the armed boot logged, and **never remove it**. It is not
+belt-and-braces: from the armed boot onwards it is load-bearing for STARTUP. See
+"After the cut-over ... pin the brand" below for what happens without it.
+
+```sh
 SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=brand-a
 ```
+
+> ⚠️ **Do not set both in the same boot with a value you have not edited.** The pin is an
+> *override*, not a cross-check: `RestampTargetEnvironmentPostProcessor` returns early on
+> any non-blank explicit value — *"The explicit value wins."* So a first boot carrying
+> both, where the pin still says the example's `brand-a` while `APP_TENANCY_ISSUERS` names
+> your real brand, re-stamps every `default` row to **`brand-a`** while every read scopes
+> to your real brand. The rows are then invisible and the `wiki_access` bans are stranded
+> — the exact failure this whole section exists to prevent, arrived at through the fix.
+> Nothing refuses that boot: the mismatch appears only as the INFO line *"re-stamp target
+> explicitly set to 'brand-a'; the derived launch domain is '<yours>' ... The explicit
+> value wins."* Taking the steps in order removes the possibility, because by the time you
+> set the pin you are copying a brand out of your own boot log.
 
 > **Step 2 is not optional and it is not cleanup.** `APP_TENANCY_ISSUERS` alone is enough
 > to *perform* the cut-over, which is why step 1 stands on its own — but from the moment
