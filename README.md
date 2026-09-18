@@ -24,6 +24,14 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
 
 ## Current State
 
+- **DEPLOYING OR TURNING MULTI-BRAND ON? Read the
+  [cut-over runbook](#cut-over-set-app_tenancy_issuers-and-redeploy--the-re-stamp-derives-its-own-target)
+  first — it is TWO environment variables, not one.** `APP_TENANCY_ISSUERS` performs the
+  cut-over; `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` is a **permanent pin**
+  that must be set afterwards and never removed, because from the armed boot onwards a boot
+  that publishes no parameter fails startup on a checksum error that does not name the
+  config change (decision 31, operator 2026-09-17). Leaving `APP_TENANCY_ISSUERS` unset is
+  a supported, deliberate state, not an unfinished one (decision 30, same date).
 - **Dependency baseline:** Spring Boot **4.0.7** / Spring Cloud **2025.1.2**, **Java 25
   LTS** (`eclipse-temurin:25`), on the shared Maven artifacts
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
@@ -346,6 +354,25 @@ its own tokens, and any token with an unknown `iss` claim is rejected with **401
 > ```
 > Leave the variable unset for a single-brand deployment.
 
+> **DECISION 30, operator 2026-09-17: HOLD opt-in.** `app.tenancy.issuers` keeps its empty
+> default (`application.yml:123`, `"${APP_TENANCY_ISSUERS:}"`) and is **not** defaulted to
+> `${CASDOOR_ISSUER_URI}=hugmesh`. This is a deliberate hold, revisit-after-the-current-push
+> — **not an oversight**, and not a TODO for the next agent to tidy up. The one-line
+> alternative was written up in full on hugmesh-wiki-bff-api#19 and declined there, because
+> defaulting it makes the platform brand live for **every** deployment with no variable set
+> and changes two behaviours nobody asked for: `isKnownDomain("hugmesh")` becomes true where
+> `isKnownDomain("default")` was false (a SUPERADMIN could then target the platform brand for
+> a cross-brand ban), and the stamped authority becomes `DOMAIN_hugmesh` instead of
+> `DOMAIN_default`.
+>
+> **Reverting it is caught.** `UnarmedRestampBootTest` boots with the shipped defaults —
+> `application-test.yml` sets no `app.tenancy.issuers`, so the test reads this exact line —
+> and asserts that no re-stamp target is published and that 007 stays `PENDING`. Measured
+> 2026-09-17: defaulting the property to `${CASDOOR_ISSUER_URI:...}=hugmesh` turns that class
+> from `Tests run: 3, Failures: 0` into `Tests run: 3, Failures: 2`
+> (`expected: null but was: "hugmesh"`, and the changeset recorded as run). Do not "fix" that
+> test; it is the pin.
+
 ### Cut-over: set `APP_TENANCY_ISSUERS` and redeploy — the re-stamp derives its own target
 
 Turning multi-brand on is **not** a config-only change on a cluster that already holds
@@ -368,10 +395,54 @@ domain-bearing tables (`wiki_page`, `wiki_attachment`, `wiki_audit_log`, `wiki_a
 one transaction — and since issue #19 it **works out the brand for itself**. You do not
 type it.
 
+**The cut-over is TWO environment variables and TWO boots.** They are written as two
+blocks on purpose — pasting both into the same deployment is the one way to corrupt the
+data this procedure exists to protect (see the warning under step 2).
+
+**Step 1 of 2 — the armed boot.** This alone re-stamps the data and brings the wiki up
+under the brand.
+
 ```sh
-# The whole cut-over. One step.
 APP_TENANCY_ISSUERS=https://casdoor.brand-a.example.com=brand-a
 ```
+
+Deploy it and **wait for the pod to be ready**. The boot log records the brand it derived
+and armed, verbatim:
+
+```
+wiki-bff 007: launch domain derived as 'brand-a' (...) — ... Arming the cut-over re-stamp:
+any domain='default' row in wiki_page, wiki_attachment, wiki_audit_log and wiki_access
+will be moved to 'brand-a' before this application serves.
+```
+
+**Step 2 of 2 — the permanent pin.** Add it to the *same* deployment **after step 1 has
+succeeded**, set to the brand the armed boot logged, and **never remove it**. It is not
+belt-and-braces: from the armed boot onwards it is load-bearing for STARTUP. See
+"After the cut-over ... pin the brand" below for what happens without it.
+
+```sh
+SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=brand-a
+```
+
+> ⚠️ **Do not set both in the same boot with a value you have not edited.** The pin is an
+> *override*, not a cross-check: `RestampTargetEnvironmentPostProcessor` returns early on
+> any non-blank explicit value — *"The explicit value wins."* So a first boot carrying
+> both, where the pin still says the example's `brand-a` while `APP_TENANCY_ISSUERS` names
+> your real brand, re-stamps every `default` row to **`brand-a`** while every read scopes
+> to your real brand. The rows are then invisible and the `wiki_access` bans are stranded
+> — the exact failure this whole section exists to prevent, arrived at through the fix.
+> Nothing refuses that boot: the mismatch appears only as the INFO line *"re-stamp target
+> explicitly set to 'brand-a'; the derived launch domain is '<yours>' ... The explicit
+> value wins."* Taking the steps in order removes the possibility, because by the time you
+> set the pin you are copying a brand out of your own boot log.
+
+> **Step 2 is not optional and it is not cleanup.** `APP_TENANCY_ISSUERS` alone is enough
+> to *perform* the cut-over, which is why step 1 stands on its own — but from the moment
+> the armed boot succeeds, any later boot that publishes **no** parameter (the variable
+> emptied, a reverted manifest, ArgoCD `selfHeal`, or a **second brand added** — the
+> documented growth path) dies in `ValidationFailedException` naming a **checksum**.
+> The pin is what makes those boots safe. **DECISION 31, operator 2026-09-17: confirmed
+> and permanent** — see the decision record below.
 
 `RestampTargetEnvironmentPostProcessor` reads that mapping through a real `DomainRegistry`
 before Liquibase binds its parameters, and publishes the brand as
@@ -379,9 +450,12 @@ before Liquibase binds its parameters, and publishes the brand as
 completes **before the application serves its first request** under the new brand, in the
 same boot that configures it. There is no window between the two and nothing to sequence.
 
-> **This replaces the old two-step procedure.** Earlier revisions of this README told you
-> to run the migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an
-> un-armed run publishes no target and migrates nothing.
+> **This replaces the old two-step procedure** — a *different* two steps, do not confuse
+> them with the two variables above. Earlier revisions of this README told you to run the
+> migration first and set `APP_TENANCY_ISSUERS` second. Do not do that now — an un-armed run
+> publishes no target and migrates nothing. The migration and the configuration move
+> together, in one boot; the pin in step 2 is what you set **after** that boot has
+> succeeded, and it migrates nothing by itself.
 
 It arms **only** when the mapping holds exactly one pair, **and that pair names the issuer
 this resource server trusts** (`CASDOOR_ISSUER_URI`):
@@ -463,7 +537,32 @@ Nothing is migrated and nothing is lost, but the error names a checksum, not the
 change, so it does not look like what it is. Measured in
 `DerivedTargetRerunTest.unArmingAfterTheCutOverREFUSESStartupUnlessTheBrandIsPinned`.
 
-> **So make the cut-over two env vars, not one.** Once the armed boot has succeeded, set
+**How strong that evidence actually is — read this before you plan around it.** The word
+"crashloops" is an *inference*, not an observation. **No real pod has ever booted any of
+this.** `DerivedTargetRerunTest` says so itself (`DerivedTargetRerunTest.java:39-41`): it
+drives `Liquibase.update()` directly against a Testcontainers Postgres, exactly as
+`DefaultDomainRestampChangesetTest` does, and is deliberately **not** a `@SpringBootTest`.
+So what is measured is that **`liquibase.update` throws `ValidationFailedException` and
+migrates nothing**; that this becomes a crashlooping pod is the ordinary consequence of
+Liquibase running during context refresh, and it is reasoned, not seen. What follows from
+that, honestly:
+
+* The failure mode and the remedy are **real and pinned** — re-run the test and it fails
+  the moment either is removed. Measured 2026-09-17: adding `<validCheckSum>ANY</validCheckSum>`
+  to the `007-restamp-default-domain-to-brand` changeSet (the "obvious fix" for a checksum
+  error) turns `Tests run: 4, Failures: 0` into `Tests run: 4, Failures: 2`.
+* What **nobody** has confirmed is the operational shape on a cluster: the exact pod
+  message, whether the readiness probe or `CrashLoopBackOff` is what an operator sees
+  first, and how ArgoCD reports it. Budget for reading the pod log, not for recognising a
+  symptom from this README.
+* `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN` has **still never been exercised
+  as a real environment variable** — only the Spring property form is covered by tests. It
+  is now also the documented permanent pin, so it is the single most valuable thing to
+  verify on the first real deployment.
+
+> **So make the cut-over two env vars, not one** — step 2 of the runbook above.
+> **DECISION 31, operator 2026-09-17: the pin is CONFIRMED and permanent.** Once the armed
+> boot has succeeded, set
 > `SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN=<brand>` **permanently** and leave
 > it there. The explicit override wins on every later boot regardless of what the derivation
 > says, so `APP_TENANCY_ISSUERS` goes back to being an ordinary scoping knob. If you are
