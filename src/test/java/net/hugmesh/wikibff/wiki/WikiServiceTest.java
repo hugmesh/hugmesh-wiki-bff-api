@@ -41,6 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       leak); the audit trail is per-brand; SUPERADMIN reads across brands.</li>
  *   <li><b>CONCURRENT-CONFLICTING</b> — two racing updates at the same expectedVersion:
  *       exactly one succeeds, the other is a 409 stale-edit; the version bumps once.</li>
+ *   <li><b>CROSS-BRAND LIST BRAND VISIBILITY (issue #17)</b> — the SUPERADMIN cross-brand
+ *       list tells two SAME-slug, SAME-title rows apart by the brand each row carries, and
+ *       that brand is the row's OWN stored domain (not the caller's scope); a scoped ADMIN
+ *       still sees only its own brand's row.</li>
  *   <li><b>DELETE SCOPING (issue #15)</b> — a SUPERADMIN delete removes exactly the row its
  *       cross-brand resolve found (and that row's attachments, via the FK cascade), never a
  *       same-slug row in {@code default} or any other brand, and audits in the page's own
@@ -212,6 +216,100 @@ class WikiServiceTest extends PostgresTestSupport {
             service.create(create(sx, "X page", "x"), adminX).block();
             // SUPERADMIN resolves the slug regardless of the authoring brand.
             assertThat(service.get(sx, su).block().title()).isEqualTo("X page");
+        }
+    }
+
+    // ── CROSS-BRAND LIST BRAND VISIBILITY (issue #17) — over the REAL store, because the
+    //    thing under test is that each summary carries ITS OWN row's stored domain, which a
+    //    mocked repository could not distinguish from a hardcoded constant ────────────────
+    @Nested
+    class CrossBrandListBrandVisibility {
+
+        private final Authentication adminX = jwtAuth("https://id.brandx.example", "admin-x", "admin");
+        private final Authentication adminY = jwtAuth("https://id.brandy.example", "admin-y", "admin");
+        private final Authentication su = jwtAuth("https://id.brandx.example", "root", "superadmin");
+
+        /** The list rows for one slug, as the given caller sees them (the store is shared with
+         *  sibling tests, so every assertion is scoped to this test's unique slug). */
+        private List<WikiDto.PageSummary> rowsFor(String slug, Authentication who) {
+            return service.list(who).filter(r -> slug.equals(r.slug())).collectList().block();
+        }
+
+        /**
+         * THE ISSUE'S HEADLINE CASE. The same slug exists in two brands (legal —
+         * {@code (domain, slug)} is UNIQUE, not {@code slug}), and BOTH rows carry the SAME
+         * TITLE. The identical title is the point: before this change a summary was
+         * {@code (id, slug, title, authorSubject, version, updatedAt)}, so two such rows were
+         * telling apart only by the opaque DB-generated id. Now the brand is on the row and it
+         * is the discriminator a human can actually read.
+         */
+        @Test
+        void superadmin_sameSlugTwoBrands_sameTitle_rowsAreDistinguishableByBrand() {
+            String s = slug("list-brand-pair");
+            WikiDto.Page px = service.create(create(s, "Runbook", "x body"), adminX).block();
+            WikiDto.Page py = service.create(create(s, "Runbook", "y body"), adminY).block();
+
+            List<WikiDto.PageSummary> rows = rowsFor(s, su);
+
+            assertThat(rows).as("SUPERADMIN's cross-brand list serves BOTH brands' rows").hasSize(2);
+            // Everything a human could previously read is identical between the two rows...
+            assertThat(rows).extracting(WikiDto.PageSummary::slug).containsOnly(s);
+            assertThat(rows).extracting(WikiDto.PageSummary::title).containsOnly("Runbook");
+            // ...so the brand is the ONLY field that tells them apart.
+            assertThat(rows).extracting(WikiDto.PageSummary::domain)
+                    .as("the two same-slug rows are distinguishable by brand")
+                    .containsExactlyInAnyOrder("brandx", "brandy");
+
+            // And the brand on each row is THAT row's own stored domain — not a constant and
+            // not a re-derivation of the CALLER's scope (the caller here is unscoped/null, and
+            // its token's issuer is brandx's, so a scope-derived value would read "brandx" or
+            // "default" on BOTH rows and the assertion above would still have to be satisfied
+            // by luck). Pinning it per id is what makes that impossible.
+            assertThat(rows).filteredOn(r -> r.id().equals(px.id()))
+                    .singleElement()
+                    .satisfies(r -> assertThat(r.domain()).isEqualTo("brandx"));
+            assertThat(rows).filteredOn(r -> r.id().equals(py.id()))
+                    .singleElement()
+                    .satisfies(r -> assertThat(r.domain()).isEqualTo("brandy"));
+
+            // The summary's brand agrees with the single-page read of the SAME row, which is
+            // where the console re-reads to confirm what it acted on.
+            assertThat(pages.findById(px.id(), null).block().domain()).isEqualTo("brandx");
+            assertThat(pages.findById(py.id(), null).block().domain()).isEqualTo("brandy");
+        }
+
+        /**
+         * The scoped case: a brand ADMIN's list is still single-brand (no cross-brand leak),
+         * and the brand its rows carry is its OWN. A stamp that read the caller's scope rather
+         * than the row would be indistinguishable from correct here — which is exactly why the
+         * SUPERADMIN case above is the load-bearing one.
+         */
+        @Test
+        void scopedAdmins_eachSeeOnlyTheirOwnBrandsRow_stampedWithThatBrand() {
+            String s = slug("list-brand-scoped");
+            service.create(create(s, "Runbook", "x body"), adminX).block();
+            service.create(create(s, "Runbook", "y body"), adminY).block();
+
+            assertThat(rowsFor(s, adminX)).singleElement()
+                    .satisfies(r -> assertThat(r.domain()).isEqualTo("brandx"));
+            assertThat(rowsFor(s, adminY)).singleElement()
+                    .satisfies(r -> assertThat(r.domain()).isEqualTo("brandy"));
+        }
+
+        /**
+         * The brand on the list row equals the brand on the FULL page read of the same slug,
+         * for the brand's own admin. The two surfaces must not disagree: the UI lists with one
+         * and confirms with the other.
+         */
+        @Test
+        void listRowBrand_agreesWithTheFullPageRead() {
+            String s = slug("list-brand-agree");
+            service.create(create(s, "Y runbook", "y"), adminY).block();
+
+            WikiDto.PageSummary row = rowsFor(s, adminY).get(0);
+            WikiDto.Page full = service.get(s, adminY).block();
+            assertThat(row.domain()).isEqualTo(full.domain()).isEqualTo("brandy");
+            assertThat(row.id()).isEqualTo(full.id());
         }
     }
 
