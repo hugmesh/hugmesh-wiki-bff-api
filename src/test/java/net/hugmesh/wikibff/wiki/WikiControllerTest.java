@@ -116,10 +116,16 @@ class WikiControllerTest {
     @Test
     void list_allowedForAdmin() {
         when(wiki.list(any())).thenReturn(Flux.just(
-                new WikiDto.PageSummary("id-1", "home", "Home", "a", 1L, Instant.now())));
+                new WikiDto.PageSummary("id-1", "brandx", "home", "Home", "a", 1L, Instant.now())));
         asAdmin().get().uri("/bff/wiki/pages").exchange()
                 .expectStatus().isOk()
-                .expectBody().jsonPath("$.pages[0].slug").isEqualTo("home");
+                .expectBody()
+                .jsonPath("$.pages[0].slug").isEqualTo("home")
+                // Issue #17: the brand must survive JSON serialization on the LIST row, not
+                // only on the single-page read. A record component that is never serialized
+                // (renamed, @JsonIgnore'd, dropped from the wire form) is invisible to a
+                // service-level test that only ever inspects Java objects.
+                .jsonPath("$.pages[0].domain").isEqualTo("brandx");
     }
 
     @Test

@@ -1033,6 +1033,9 @@
           "id" : {
             "type" : "string"
           },
+          "domain" : {
+            "type" : "string"
+          },
           "slug" : {
             "type" : "string"
           },
