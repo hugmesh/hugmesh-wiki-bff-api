@@ -1,9 +1,65 @@
-name: Release
-
-# Manual-only for now: this workflow is intentionally inert until a human wires up
-# the required secrets/vars below and enables it. It is modeled on this repo's
+# ─────────────────────────────────────────────────────────────────────────────
+# Release: build + publish the container image to GHCR.
+#
+# Manual-only for now: this workflow is intentionally inert until a human wires
+# up the runner and secrets below and enables it. It is modeled on this repo's
 # existing .gitlab-ci.yml `build:image` job (container build + push), ported to
 # GitHub Actions + GHCR.
+#
+# NOTHING IN THIS FILE HAS EVER EXECUTED, and this change does not produce a
+# green run. Measured 2026-09-17:
+# GET /repos/hugmesh/hugmesh-wiki-bff-api/actions/runners -> total_count 0 — no
+# self-hosted runner carrying the `hugmesh-x86` label is registered here, and
+# github-HOSTED runners are billing-blocked account-wide. Registering the runner
+# is operator-held. See .github/SELF_HOSTED_RUNNER.md.
+#
+# RUNNER — must be SELF-HOSTED in-cluster (tailnet).
+# The build stage resolves the private net.hugmesh:hugmesh-commons /
+# hugmesh-parent artifacts from the in-cluster GitLab group Maven registry,
+# which is reachable only over the tailnet. A github.com-hosted runner cannot
+# reach it at all, so `ubuntu-latest` here could never have worked even with
+# every secret set.
+#
+# PREREQS (one-time, org/repo settings — not something this workflow can set):
+#   - A self-hosted runner labelled `hugmesh-x86` — see .github/SELF_HOSTED_RUNNER.md
+#   - Repo/org SECRETS (all three are `secrets.`, never `vars.` — see below):
+#       GITLAB_MAVEN_TOKEN  -> read-scoped token for the GitLab group Maven registry
+#                              (passed into the image build as the BuildKit
+#                              `ci_job_token` secret; never an ARG/ENV/layer)
+#       GITLAB_API_V4_URL   -> the in-cluster GitLab API v4 URL
+#       GITLAB_GROUP_ID     -> the HugMesh GitLab group id
+#   - `packages: write` is granted below via GITHUB_TOKEN; no extra PAT needed.
+#
+# WHY THE NAMES CHANGED HERE (decision 43a = A)
+# This file previously read `secrets.GITLAB_CI_JOB_TOKEN` + `vars.CI_API_V4_URL`
+# + `vars.GITLAB_GROUP_ID`. `vars.X` and `secrets.X` are DIFFERENT namespaces: an
+# org/repo secret does NOT satisfy a `vars.` expression, and an unset `vars.`
+# expression interpolates to the empty string with no warning. The three release
+# workflows (forum / wiki / mesh) disagreed on exactly these three settings, so
+# they are now unified on forum-bff's all-secrets spelling.
+#
+# The resulting failure is NOT loud. Measured 2026-09-17 with
+# `maven-help-plugin:3.5.1:effective-settings` against this repo's committed
+# settings.xml, with CI_API_V4_URL / GITLAB_GROUP_ID / CI_JOB_TOKEN unset:
+#
+#   <url>${env.CI_API_V4_URL}/groups/${env.GITLAB_GROUP_ID}/-/packages/maven</url>
+#   <value>${env.CI_JOB_TOKEN}</value>
+#
+# Maven does NOT interpolate an unset ${env.*} to empty — it leaves the LITERAL
+# text in the repository URL and in the Job-Token header. The same command with
+# the three set renders `https://gitlab.example/api/v4/groups/42/-/packages/maven`
+# and `tok`, so the contrast is the variable, not the plugin. The literal URL is
+# not a valid endpoint, so the build dies much later as an unresolvable parent
+# POM — a message that points at Maven, not at a missing secret. The preflight
+# step below turns that into a named, immediate failure instead.
+#
+# ACTION REQUIRED IF `vars.` WERE EVER SET: renaming these means any existing
+# Actions *variables* named CI_API_V4_URL / GITLAB_GROUP_ID, and any secret named
+# GITLAB_CI_JOB_TOKEN, are no longer read. Re-create them as the three SECRETS
+# named above, then delete the stale variables so they cannot mislead a reader.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Release
+
 on:
   workflow_dispatch: {}
 
@@ -12,13 +68,65 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    # Self-hosted, in-cluster (tailnet) — see the RUNNER note above and
+    # .github/SELF_HOSTED_RUNNER.md.
+    runs-on: [self-hosted, hugmesh-x86]
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Fail here, by NAME, rather than letting an unset value reach Maven as a
+      # literal ${env.*} and surface 10 minutes later as an unresolvable parent
+      # POM. Values are never echoed — only the names of what is missing.
+      - name: Preflight — required registry inputs and Docker
+        env:
+          GITLAB_MAVEN_TOKEN: ${{ secrets.GITLAB_MAVEN_TOKEN }}
+          GITLAB_API_V4_URL: ${{ secrets.GITLAB_API_V4_URL }}
+          GITLAB_GROUP_ID: ${{ secrets.GITLAB_GROUP_ID }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [ -n "${GITLAB_MAVEN_TOKEN:-}" ] || missing+=(GITLAB_MAVEN_TOKEN)
+          [ -n "${GITLAB_API_V4_URL:-}" ]  || missing+=(GITLAB_API_V4_URL)
+          [ -n "${GITLAB_GROUP_ID:-}" ]    || missing+=(GITLAB_GROUP_ID)
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "FATAL: unset repo/org SECRET(S): ${missing[*]}"
+            echo
+            echo "These three feed the committed settings.xml placeholders"
+            echo "\${env.CI_JOB_TOKEN}, \${env.CI_API_V4_URL} and \${env.GITLAB_GROUP_ID}."
+            echo "Maven does NOT treat an unset one as empty: it leaves the literal"
+            echo "  \${env.CI_API_V4_URL}/groups/\${env.GITLAB_GROUP_ID}/-/packages/maven"
+            echo "in the repository URL, so the build would fail far downstream as an"
+            echo "unresolvable parent POM instead of naming the missing input."
+            echo
+            echo "All three are 'secrets.', NOT 'vars.' — they are separate namespaces,"
+            echo "and a secret does not satisfy a vars. expression. If this repo still"
+            echo "has Actions VARIABLES named CI_API_V4_URL / GITLAB_GROUP_ID, or a"
+            echo "secret named GITLAB_CI_JOB_TOKEN, they are no longer read: re-create"
+            echo "them under Settings -> Secrets and variables -> Actions -> Secrets"
+            echo "with the names above. See .github/SELF_HOSTED_RUNNER.md."
+            exit 1
+          fi
+
+          # This job builds a container image, so a runner without a usable
+          # Docker daemon can only fail obscurely inside setup-buildx.
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "FATAL: no docker on this runner; the image build cannot run."
+            echo "See .github/SELF_HOSTED_RUNNER.md for the runner requirements."
+            exit 1
+          fi
+          if ! docker version >/dev/null 2>&1; then
+            echo "FATAL: docker is on PATH but the daemon is unreachable"
+            echo "       (permissions on /var/run/docker.sock, or it is not running)."
+            exit 1
+          fi
+
+          echo "Preflight OK: all three registry secrets are set; Docker is usable."
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,12 +143,10 @@ jobs:
         run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       # This service depends on the private net.hugmesh:hugmesh-commons artifact
-      # (see settings.xml), historically resolved in CI from the org's GitLab Maven
-      # Package Registry using a job-scoped CI_JOB_TOKEN (see .gitlab-ci.yml). That
-      # token has no GitHub equivalent, so it must be supplied as a repo secret
-      # (GITLAB_CI_JOB_TOKEN) before this workflow can build successfully; the
-      # registry coordinates are passed through as build-args exactly as the
-      # Dockerfile / settings.xml already expect.
+      # (see settings.xml), resolved in CI from the org's GitLab group Maven
+      # Package Registry. The credential goes in as a BuildKit secret (never an
+      # ARG/ENV/layer); the registry coordinates go in as build-args exactly as
+      # the Dockerfile / settings.xml already expect.
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -51,7 +157,7 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
             ${{ env.IMAGE }}:latest
           build-args: |
-            CI_API_V4_URL=${{ vars.CI_API_V4_URL }}
-            GITLAB_GROUP_ID=${{ vars.GITLAB_GROUP_ID }}
+            CI_API_V4_URL=${{ secrets.GITLAB_API_V4_URL }}
+            GITLAB_GROUP_ID=${{ secrets.GITLAB_GROUP_ID }}
           secrets: |
-            ci_job_token=${{ secrets.GITLAB_CI_JOB_TOKEN }}
+            ci_job_token=${{ secrets.GITLAB_MAVEN_TOKEN }}
