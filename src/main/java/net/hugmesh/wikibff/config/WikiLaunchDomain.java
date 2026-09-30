@@ -103,16 +103,21 @@ import net.hugmesh.commons.security.DomainRegistry;
  * pair</em> — literally true, and the explicit {@code wiki.restamp.target.domain}
  * override remains the escape hatch for a deliberate multi-issuer cut-over.
  *
- * <h2>What this guard does NOT cover (issue #22)</h2>
+ * <h2>What this class does NOT cover, and who does (issue #22)</h2>
  *
  * <p>The SUPERADMIN-authored-{@code 'default'}-row hazard above is a property of the
  * DATA; every rule here is a property of the CONFIGURATION, and the data outlives the
  * shape. Narrowing {@code app.tenancy.issuers} from two-or-more pairs down to one
  * (decommissioning a brand) leaves 007 still PENDING — it never ran under the refused
- * shape — so the next boot arms and sweeps whatever {@code 'default'} rows that cluster
- * accumulated. Nothing in this class can see them. The pre-flight in the 007 header
- * ({@code SELECT domain, count(*) FROM wiki_page GROUP BY domain}) is the gate for that
- * transition, and issue #22 carries the options for making the precondition data-aware.
+ * shape — so a config-only derivation would arm and sweep whatever {@code 'default'} rows
+ * that cluster accumulated. Nothing in this class can see them, so
+ * {@link RestampTargetEnvironmentPostProcessor} gives the database a veto through
+ * {@code RestampDataGuard}: it refuses to arm when any domain-bearing table holds a row in
+ * a domain other than {@code 'default'} and the target, unless 007 is already recorded.
+ * Residual: a cluster whose only authored rows are SUPERADMIN {@code 'default'} rows shows
+ * no foreign domain, so the pre-flight in the 007 header
+ * ({@code SELECT domain, count(*) FROM wiki_page GROUP BY domain}) stays the operator's
+ * gate for that case.
  */
 public final class WikiLaunchDomain {
 
