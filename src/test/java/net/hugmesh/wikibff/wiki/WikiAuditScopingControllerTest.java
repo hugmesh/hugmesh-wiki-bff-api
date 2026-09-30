@@ -28,6 +28,7 @@ import java.util.function.Consumer;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mockingDetails;
@@ -167,11 +168,18 @@ class WikiAuditScopingControllerTest {
         return pageRow(domain, slug, "id-" + slug);
     }
 
-    /** A row with an EXPLICIT id — the delete tests pin the delete to the resolved row's id,
-     *  so two same-slug rows in different brands must be distinguishable by id. */
+    /** A row with an EXPLICIT id — the delete/update/publish tests pin the write to the
+     *  resolved row's id, so two same-slug rows in different brands must be distinguishable
+     *  by id. */
     private static WikiPage pageRow(String domain, String slug, String id) {
+        return pageRow(domain, slug, id, 1L);
+    }
+
+    /** A row with an EXPLICIT id AND version — for stale-version-conflict cases where the
+     *  current stored version differs from what the caller expected. */
+    private static WikiPage pageRow(String domain, String slug, String id, long version) {
         return new WikiPage(id, domain, slug, "Title", "# md", "<h1>md</h1>",
-                "author-1", 1L, Instant.now(), Instant.now(), false, null);
+                "author-1", version, Instant.now(), Instant.now(), false, null);
     }
 
     /** Capture the {@code domain} the delete audit row was stamped with — produced by the
@@ -346,9 +354,15 @@ class WikiAuditScopingControllerTest {
     }
 
     @Test
-    void update_brandYAdmin_repoUpdateScopedToBrandY_authorFromJwtSub() {
-        when(pages.updateBySlug(eq("home"), any(), any(), any(), any(), eq(1L), any()))
-                .thenReturn(Mono.just(pageRow("brandy", "home")));
+    void update_brandYAdmin_resolvesInBrandY_updatesThatRowsId_brandXRowUnreachable() {
+        // update() first findBySlug(slug, brandy) — a brand-X page must be invisible here,
+        // so a brand-Y admin can never update another brand's page. Mirrors the delete
+        // rewrite below: prove BOTH that the scoped lookup is brandy AND that the update
+        // is pinned to the id that lookup returned.
+        when(pages.findBySlug(eq("home"), eq("brandy"))).thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home")));
+        when(pages.findBySlug(eq("home"), eq("brandx"))).thenReturn(Mono.just(pageRow("brandx", "home", "id-x-home")));
+        when(pages.updateById(eq("id-y-home"), any(), any(), any(), any(), eq(1L)))
+                .thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home")));
         when(auditRepo.record(any(), any(), any(), any(), any()))
                 .thenReturn(Mono.just(auditRow("brandy", "wiki.page.update", "home")));
 
@@ -357,23 +371,147 @@ class WikiAuditScopingControllerTest {
                 .bodyValue("{\"title\":\"T\",\"contentMarkdown\":\"b\",\"expectedVersion\":1}")
                 .exchange().expectStatus().isOk();
 
+        // MUTATION-RESISTANT: the resolve is brand-Y scoped and the brand-X lookup is
+        // never consulted; the update is by the RESOLVED row's id, so brand-X's same-slug
+        // row (a different id) is structurally unreachable — there is no domain left to
+        // coerce or leak.
         org.mockito.ArgumentCaptor<String> author = org.mockito.ArgumentCaptor.forClass(String.class);
-        org.mockito.ArgumentCaptor<String> domain = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(pages).updateBySlug(eq("home"), any(), any(), any(), author.capture(), eq(1L), domain.capture());
-        assertThat(domain.getValue()).as("update scoped to brandy (the OTHER brand, issuer-derived)").isEqualTo("brandy");
+        verify(pages).findBySlug("home", "brandy");
+        verify(pages, never()).findBySlug("home", "brandx");
+        verify(pages).updateById(eq("id-y-home"), any(), any(), any(), author.capture(), eq(1L));
+        verify(pages, never()).updateById(eq("id-x-home"), any(), any(), any(), any(), anyLong());
         assertThat(author.getValue()).as("re-stamped author==subject is the validated JWT sub").isEqualTo("actor-1");
+        org.mockito.ArgumentCaptor<String> auditDomain = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(auditRepo).record(any(), eq("wiki.page.update"), any(), any(), auditDomain.capture());
+        assertThat(auditDomain.getValue()).as("the update audit lands in the brand the page lived in").isEqualTo("brandy");
+    }
+
+    // ── SUPERADMIN update/publish (issue #33 / decision 59): resolve cross-brand, act on
+    //    THAT row's id, audit in ITS brand — reproduces #17's measured probe exactly ──
+
+    @Test
+    void update_superadmin_pageInNonDefaultBrand_updatesResolvedRowById_auditsInPageBrand() {
+        // Issue #33's probe: a SUPERADMIN's scope is null (cross-brand resolve) and the
+        // OLD update coerced that null to "default" — UPDATE ... WHERE slug=? AND
+        // domain='default' AND version=1 — which never matched brandy's row, and the
+        // secondary read that built the 409 message was ITSELF cross-brand, so it echoed
+        // the resolved row's OWN version back as "stale" against itself: a
+        // self-contradicting "page is at version 1, not 1". The fix updates by the
+        // resolved id, so this now succeeds.
+        when(pages.findBySlug(eq("runbook"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "runbook", "id-y-runbook")));
+        when(pages.updateById(eq("id-y-runbook"), any(), any(), any(), any(), eq(1L)))
+                .thenReturn(Mono.just(pageRow("brandy", "runbook", "id-y-runbook", 2L)));
+        when(auditRepo.record(any(), any(), any(), any(), any()))
+                .thenReturn(Mono.just(auditRow("brandy", "wiki.page.update", "runbook")));
+
+        as(BRANDX_ISS, "superadmin").put().uri("/bff/wiki/admin/pages/runbook")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"title\":\"T\",\"contentMarkdown\":\"b\",\"expectedVersion\":1}")
+                .exchange().expectStatus().isOk();
+
+        verify(pages).findBySlug("runbook", null);
+        verify(pages).updateById(eq("id-y-runbook"), any(), any(), any(), any(), eq(1L));
+        org.mockito.ArgumentCaptor<String> auditDomain = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(auditRepo).record(any(), eq("wiki.page.update"), any(), any(), auditDomain.capture());
+        assertThat(auditDomain.getValue())
+                .as("the update audit is stamped with the brand the page actually lived in")
+                .isEqualTo("brandy");
     }
 
     @Test
-    void publish_brandXAdmin_repoPublishScopedToBrandX() {
-        when(pages.publishBySlug(eq("home"), any())).thenReturn(Mono.just(pageRow("brandx", "home")));
+    void update_resolvedRowVanishes_is404_neverTheSelfContradicting409() {
+        // The resolved row vanished before the UPDATE ran (a concurrent delete). updateById
+        // matches zero rows; the secondary re-read is BY THE SAME ID (never slug+domain), so
+        // an id that is genuinely gone is a 404, not a re-derivation that could contradict
+        // itself the way the pre-fix slug+domain re-read did.
+        when(pages.findBySlug(eq("gone"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "gone", "id-y-gone")));
+        when(pages.updateById(eq("id-y-gone"), any(), any(), any(), any(), eq(1L))).thenReturn(Mono.empty());
+        when(pages.findById(eq("id-y-gone"), isNull())).thenReturn(Mono.empty());
+
+        as(BRANDX_ISS, "superadmin").put().uri("/bff/wiki/admin/pages/gone")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"title\":\"T\",\"contentMarkdown\":\"b\",\"expectedVersion\":1}")
+                .exchange().expectStatus().isNotFound();
+
+        verify(pages).findById("id-y-gone", null);
+        verify(auditRepo, never()).record(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void update_genuineStaleVersion_is409_reportsCurrentVersionFromTheSameResolvedId() {
+        // A real concurrent edit: updateById's version guard matches zero rows because the
+        // row moved on (not because of a coerced domain). The secondary read is BY ID, so
+        // it reports the SAME row's current version — never a different brand's row.
+        when(pages.findBySlug(eq("home"), eq("brandy")))
+                .thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home")));
+        when(pages.updateById(eq("id-y-home"), any(), any(), any(), any(), eq(1L))).thenReturn(Mono.empty());
+        when(pages.findById(eq("id-y-home"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home", 3L)));
+
+        as(BRANDY_ISS, "admin").put().uri("/bff/wiki/admin/pages/home")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"title\":\"T\",\"contentMarkdown\":\"b\",\"expectedVersion\":1}")
+                .exchange().expectStatus().isEqualTo(409)
+                .expectBody().jsonPath("$.error")
+                .isEqualTo("stale edit: page 'home' is at version 3, not 1");
+
+        verify(auditRepo, never()).record(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void publish_brandXAdmin_resolvesInBrandX_publishesThatRowsId_brandYRowUnreachable() {
+        when(pages.findBySlug(eq("home"), eq("brandx"))).thenReturn(Mono.just(pageRow("brandx", "home", "id-x-home")));
+        when(pages.findBySlug(eq("home"), eq("brandy"))).thenReturn(Mono.just(pageRow("brandy", "home", "id-y-home")));
+        when(pages.publishById("id-x-home")).thenReturn(Mono.just(pageRow("brandx", "home", "id-x-home")));
         when(auditRepo.record(any(), any(), any(), any(), any()))
                 .thenReturn(Mono.just(auditRow("brandx", "wiki.page.publish", "home")));
 
         as(BRANDX_ISS, "admin").post().uri("/bff/wiki/admin/pages/home/publish")
                 .exchange().expectStatus().isOk();
 
-        verify(pages).publishBySlug("home", "brandx");
+        verify(pages).findBySlug("home", "brandx");
+        verify(pages, never()).findBySlug("home", "brandy");
+        verify(pages).publishById("id-x-home");
+        verify(pages, never()).publishById("id-y-home");
+    }
+
+    @Test
+    void publish_superadmin_pageInNonDefaultBrand_publishesResolvedRowById_auditsInPageBrand() {
+        // Issue #33's other probe: the OLD publish coerced a SUPERADMIN's null scope to
+        // "default" — UPDATE ... WHERE slug=? AND domain='default' — which never matched
+        // brandy's row, so POST /publish answered 404 for a page the SAME caller could
+        // GET moments earlier. The fix publishes by the resolved id, so this now succeeds.
+        when(pages.findBySlug(eq("runbook"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "runbook", "id-y-runbook")));
+        when(pages.publishById("id-y-runbook")).thenReturn(Mono.just(pageRow("brandy", "runbook", "id-y-runbook")));
+        when(auditRepo.record(any(), any(), any(), any(), any()))
+                .thenReturn(Mono.just(auditRow("brandy", "wiki.page.publish", "runbook")));
+
+        as(BRANDX_ISS, "superadmin").post().uri("/bff/wiki/admin/pages/runbook/publish")
+                .exchange().expectStatus().isOk();
+
+        verify(pages).findBySlug("runbook", null);
+        verify(pages).publishById("id-y-runbook");
+        org.mockito.ArgumentCaptor<String> auditDomain = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(auditRepo).record(any(), eq("wiki.page.publish"), any(), any(), auditDomain.capture());
+        assertThat(auditDomain.getValue())
+                .as("the publish audit is stamped with the brand the page actually lived in")
+                .isEqualTo("brandy");
+    }
+
+    @Test
+    void publish_resolvedRowVanishes_is404_neverAudited() {
+        when(pages.findBySlug(eq("gone"), isNull()))
+                .thenReturn(Mono.just(pageRow("brandy", "gone", "id-y-gone")));
+        when(pages.publishById("id-y-gone")).thenReturn(Mono.empty());
+
+        as(BRANDX_ISS, "superadmin").post().uri("/bff/wiki/admin/pages/gone/publish")
+                .exchange().expectStatus().isNotFound();
+
+        verify(pages).publishById("id-y-gone");
+        verify(auditRepo, never()).record(any(), any(), any(), any(), any());
     }
 
     @Test

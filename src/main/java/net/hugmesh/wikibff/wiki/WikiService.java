@@ -122,41 +122,71 @@ public class WikiService {
     }
 
     /**
-     * Update a page by slug in the caller's brand. Renders markdown->HTML at write,
-     * bumps {@code version} (guarded on {@code expectedVersion} for optimistic
-     * concurrency), re-stamps the author from the JWT subject, and audits
-     * {@code wiki.page.update}. A missing slug is a 404; a stale {@code expectedVersion}
-     * (a concurrent overwrite) is a 409.
+     * Update a page by slug. The page is resolved in the caller's scope ({@link #scopeOf}:
+     * a brand for a scoped ADMIN, the cross-brand bypass for SUPERADMIN) and then updated
+     * <b>by the id of that resolved row</b> — never by slug+domain — so the update can only
+     * ever touch the row the resolve found. Issue #33 / decision 59: a SUPERADMIN's
+     * {@code null} scope used to be coerced to {@code default} on the update, which for a
+     * page outside {@code default} matched zero rows and answered a self-contradicting 409
+     * ("page is at version 1, not 1" — the secondary read that built that message was
+     * ITSELF cross-brand, so it reported the resolved row's true version back as if it
+     * were stale against itself).
      *
-     * <p>The conditional UPDATE returns empty for both "slug missing" and "stale version",
-     * so a secondary read distinguishes them:
+     * <p>Renders markdown-&gt;HTML at write, bumps {@code version} (guarded on
+     * {@code expectedVersion} for optimistic concurrency), re-stamps the author from the
+     * JWT subject, and audits {@code wiki.page.update} in the brand the page actually
+     * lives in ({@code page.domain()}, never the caller's — possibly {@code null} —
+     * scope). A missing slug in the caller's scope is a 404; a stale
+     * {@code expectedVersion} (a concurrent overwrite, or the resolved id vanishing) is
+     * distinguished by a secondary read on that SAME id:
      *
      * <pre>
-     * updateBySlug(slug, ...)  ─ row matched ──→ audit.record  ──→ Page.of(saved)
-     *                          └─ empty ─────→ findBySlug(slug)
-     *                                          ├─ found ────→ 409 stale edit (existing.version != expected)
-     *                                          └─ empty ────→ 404 page not found
+     * findBySlug(slug, scope) ─ empty ──→ 404 page not found
+     *                          └─ page ──→ updateById(page.id(), ..., expectedVersion)
+     *                                      ├─ row ───→ audit.record(..., page.domain()) ──→ Page.of(saved)
+     *                                      └─ empty ─→ findById(page.id(), null)
+     *                                                  ├─ found ──→ 409 stale edit (existing.version != expected)
+     *                                                  └─ empty ──→ 404 page not found (vanished concurrently)
      * </pre>
      *
-     * @param slug the URL-stable page key within the caller's brand
+     * @param slug the URL-stable page key (within the caller's brand; any brand for SUPERADMIN)
      * @param body the update request (title, contentMarkdown, expectedVersion)
      * @param auth the caller's Spring Security principal
      * @return a {@link Mono} emitting the updated {@link WikiDto.Page}
-     * @throws ApiException 404 when the slug is not found in the caller's brand
+     * @throws ApiException 404 when the slug is not found in the caller's scope, or the
+     *                      resolved row was gone by the time the update ran
      * @throws ApiException 409 when {@code expectedVersion} does not match the stored version
      */
     public Mono<WikiDto.Page> update(String slug, WikiDto.UpdatePage body, Authentication auth) {
         String domain = scopeOf(auth);
         String author = subject(auth);
         String html = markdown.toHtml(body.contentMarkdown());
-        // Distinguish "missing slug" (404) from "stale version" (409): the conditional
-        // UPDATE returns empty for BOTH, so re-read to tell them apart.
-        return pages.updateBySlug(slug, body.title(), body.contentMarkdown(), html, author,
-                        body.expectedVersion(), domain)
+        return pages.findBySlug(slug, domain)
+                .switchIfEmpty(Mono.error(ApiException.notFound("wiki page not found: " + slug)))
+                .flatMap(page -> updateResolvedPage(page, slug, body, author, html));
+    }
+
+    /**
+     * The second half of {@link #update}: apply the version-guarded UPDATE to the ALREADY
+     * resolved row's id, audit success in the row's own brand, and on a zero-row result
+     * distinguish "id vanished" (404) from "stale version" (409) via a re-read BY THE SAME
+     * ID — split out from {@link #update} purely to keep that lambda short.
+     *
+     * @param page   the row {@link #update} already resolved in the caller's scope
+     * @param slug   the URL-stable page key (for the 404/409 messages)
+     * @param body   the update request (title, contentMarkdown, expectedVersion)
+     * @param author the Casdoor {@code sub} of the editing principal (server-derived)
+     * @param html   the newly rendered HTML for {@code body.contentMarkdown()}
+     * @return a {@link Mono} emitting the updated {@link WikiDto.Page}
+     */
+    private Mono<WikiDto.Page> updateResolvedPage(WikiPage page, String slug, WikiDto.UpdatePage body,
+                                                   String author, String html) {
+        return pages.updateById(page.id(), body.title(), body.contentMarkdown(), html,
+                        author, body.expectedVersion())
                 .flatMap(saved -> audit.record(author, "wiki.page.update", saved.slug(),
-                                "v" + saved.version(), domain)
+                                "v" + saved.version(), page.domain())
                         .thenReturn(WikiDto.Page.of(saved)))
-                .switchIfEmpty(Mono.defer(() -> pages.findBySlug(slug, domain)
+                .switchIfEmpty(Mono.defer(() -> pages.findById(page.id(), null)
                         .flatMap(existing -> Mono.<WikiDto.Page>error(ApiException.conflict(
                                 "stale edit: page '" + slug + "' is at version " + existing.version()
                                         + ", not " + body.expectedVersion())))
@@ -165,25 +195,38 @@ public class WikiService {
 
     /**
      * Publish a page (mark the current content as the published snapshot the ZIM
-     * (re)build packages). The content store already holds the rendered HTML at write,
-     * so publish flips {@code is_published}/{@code published_at} plus the audit record —
-     * the explicit signal that the page is ready for the next ZIM rebuild (PR4, out of
-     * repo, wires the actual ZIM trigger). A missing slug in the caller's brand is a 404.
+     * (re)build packages). The page is resolved in the caller's scope ({@link #scopeOf})
+     * and then published <b>by the id of that resolved row</b> — never by slug+domain —
+     * so the publish can only ever touch the row the resolve found. Issue #33 / decision
+     * 59: a SUPERADMIN's {@code null} scope used to be coerced to {@code default} on the
+     * publish, which for a page outside {@code default} matched zero rows and answered a
+     * 404 for a page the SAME caller could {@code GET} moments earlier.
      *
-     * @param slug the URL-stable page key within the caller's brand
+     * <p>The content store already holds the rendered HTML at write, so publish flips
+     * {@code is_published}/{@code published_at} plus the audit record — the explicit
+     * signal that the page is ready for the next ZIM rebuild (PR4, out of repo, wires the
+     * actual ZIM trigger). The audit row is stamped with the brand the page actually
+     * lives in ({@code page.domain()}), never the caller's — possibly {@code null} —
+     * scope. A missing slug in the caller's scope is a 404; so is the resolved id
+     * vanishing concurrently between the resolve and the publish.
+     *
+     * @param slug the URL-stable page key (within the caller's brand; any brand for SUPERADMIN)
      * @param auth the caller's Spring Security principal
      * @return a {@link Mono} emitting the published {@link WikiDto.Page} (with
      *         {@code published=true} and {@code publishedAt} set)
-     * @throws ApiException 404 when the slug is not found in the caller's brand
+     * @throws ApiException 404 when the slug is not found in the caller's scope, or the
+     *                      resolved row was gone by the time the publish ran
      */
     public Mono<WikiDto.Page> publish(String slug, Authentication auth) {
         String domain = scopeOf(auth);
         String actor = subject(auth);
-        return pages.publishBySlug(slug, domain)
+        return pages.findBySlug(slug, domain)
                 .switchIfEmpty(Mono.error(ApiException.notFound("wiki page not found: " + slug)))
-                .flatMap(page -> audit.record(actor, "wiki.page.publish", page.slug(),
-                                "v" + page.version(), domain)
-                        .thenReturn(WikiDto.Page.of(page)));
+                .flatMap(page -> pages.publishById(page.id())
+                        .switchIfEmpty(Mono.error(ApiException.notFound("wiki page not found: " + slug)))
+                        .flatMap(published -> audit.record(actor, "wiki.page.publish", published.slug(),
+                                        "v" + published.version(), page.domain())
+                                .thenReturn(WikiDto.Page.of(published))));
     }
 
     /**

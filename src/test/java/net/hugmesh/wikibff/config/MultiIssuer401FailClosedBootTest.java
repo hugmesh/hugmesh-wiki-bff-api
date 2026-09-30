@@ -103,12 +103,41 @@ class MultiIssuer401FailClosedBootTest extends PostgresTestSupport {
      * brand-X so the single-issuer fallback, were it (wrongly) taken, would still
      * resolve a real issuer — making the multi-issuer swap the ONLY thing that lets
      * brand-Y in and the ONLY thing that keeps the rogue out.
+     *
+     * <p><b>jwk-set-uri is repointed at brand-X's own JWKS, not cleared (issue #24).</b>
+     * {@code application.yml} pins {@code spring.security.oauth2.resourceserver.jwt
+     * .jwk-set-uri} to the PRODUCTION Casdoor JWKS ({@code https://id.hugmesh.net/...})
+     * so the single-issuer path never does OIDC discovery in prod (PR #6). Left
+     * unoverridden here, {@link TenancyResourceServerConfig#decoderForIssuer} takes its
+     * discovery-FREE fast path for brand-X (it IS the back-compat issuer above) and
+     * builds a decoder straight from that pinned production URL — dialing a real
+     * hostname from an offline test and 500ing on NXDOMAIN, 3 of 8 cases, instead of
+     * ever reaching the fail-closed / accept assertions under test.
+     *
+     * <p>The property is repointed at {@code BRAND_X}'s own served JWKS, NOT cleared
+     * to {@code ""}: this test boots the FULL application context (unlike the
+     * hand-wired {@link MultiIssuerSecuritySliceTest}), and Spring Boot's own
+     * autoconfigured {@code jwtDecoder} bean
+     * ({@code ReactiveOAuth2ResourceServerJwtConfiguration.JwtConfiguration}) is an
+     * eager (non-lazy) singleton built from this SAME property whether or not the
+     * multi-issuer swap ends up using it — {@code NimbusReactiveJwtDecoder
+     * .withJwkSetUri("")} throws {@code IllegalArgumentException("jwkSetUri cannot be
+     * empty")} at context-refresh time, which fails ALL 8 cases with a context-load
+     * error instead of fixing 3 (measured). A single {@code jwk-set-uri} is the
+     * "wrong shape" for a genuinely N-brand multi-issuer deployment (see the issue),
+     * but is exactly right for THIS back-compat entry: only brand-X (the issuer-uri
+     * override above) is ever resolved through {@code backCompatJwkSetUri} —
+     * brand-Y is never the back-compat issuer, so it already takes
+     * {@code fromIssuerLocation} discovery against its own {@code TestIssuer}
+     * regardless of this property, unaffected either way.
      */
     @DynamicPropertySource
     static void tenancyIssuers(DynamicPropertyRegistry registry) {
         registry.add("app.tenancy.issuers",
                 () -> BRAND_X.issuerUri() + "=brandx," + BRAND_Y.issuerUri() + "=brandy");
         registry.add("spring.security.oauth2.resourceserver.jwt.issuer-uri", BRAND_X::issuerUri);
+        registry.add("spring.security.oauth2.resourceserver.jwt.jwk-set-uri",
+                () -> BRAND_X.issuerUri() + "/.well-known/jwks.json");
     }
 
     @AfterAll

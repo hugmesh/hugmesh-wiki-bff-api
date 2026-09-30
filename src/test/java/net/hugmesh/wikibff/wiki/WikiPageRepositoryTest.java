@@ -68,9 +68,9 @@ class WikiPageRepositoryTest extends PostgresTestSupport {
         @Test
         void update_bumpsVersionAndReplacesContent() {
             String s = slug("us-update");
-            repo.create(s, "T1", "a", "<p>a</p>", "author-1", "brandx").block();
+            WikiPage created = repo.create(s, "T1", "a", "<p>a</p>", "author-1", "brandx").block();
 
-            WikiPage updated = repo.updateBySlug(s, "T2", "b", "<p>b</p>", "author-2", 1L, "brandx").block();
+            WikiPage updated = repo.updateById(created.id(), "T2", "b", "<p>b</p>", "author-2", 1L).block();
             assertThat(updated).isNotNull();
             assertThat(updated.version()).isEqualTo(2L);
             assertThat(updated.title()).isEqualTo("T2");
@@ -79,36 +79,43 @@ class WikiPageRepositoryTest extends PostgresTestSupport {
         }
 
         @Test
-        void publishBySlug_setsIsPublishedAndPublishedAt() {
+        void publishById_setsIsPublishedAndPublishedAt() {
             String s = slug("us-publish");
-            repo.create(s, "T", "m", "<p>m</p>", "author-1", "brandx").block();
+            WikiPage created = repo.create(s, "T", "m", "<p>m</p>", "author-1", "brandx").block();
 
             // Newly created page is in DRAFT state.
             WikiPage draft = repo.findBySlug(s, "brandx").block();
             assertThat(draft.published()).isFalse();
             assertThat(draft.publishedAt()).isNull();
 
-            WikiPage pub = repo.publishBySlug(s, "brandx").block();
+            WikiPage pub = repo.publishById(created.id()).block();
             assertThat(pub).isNotNull();
             assertThat(pub.published()).isTrue();
             assertThat(pub.publishedAt()).isNotNull();
         }
 
         @Test
-        void publishBySlug_unknownSlug_returnsEmpty() {
-            assertThat(repo.publishBySlug("no-such-slug-" + SEQ.incrementAndGet(), "brandx")
-                    .blockOptional()).isEmpty();
+        void publishById_unknownId_returnsEmpty() {
+            String absentId = "aaaaaaaa-aaaa-4aaa-8aaa-" + String.format("%012x", SEQ.incrementAndGet());
+            assertThat(repo.publishById(absentId).blockOptional()).isEmpty();
         }
 
         @Test
         void update_staleVersion_updatesNothing() {
             String s = slug("us-stale");
-            repo.create(s, "T1", "a", "<p>a</p>", "author-1", "brandx").block();
+            WikiPage created = repo.create(s, "T1", "a", "<p>a</p>", "author-1", "brandx").block();
             // The page is at version 1; an update claiming version 5 (stale) matches no row.
-            assertThat(repo.updateBySlug(s, "T2", "b", "<p>b</p>", "author-2", 5L, "brandx")
+            assertThat(repo.updateById(created.id(), "T2", "b", "<p>b</p>", "author-2", 5L)
                     .blockOptional()).isEmpty();
             // The page is unchanged at version 1.
             assertThat(repo.findBySlug(s, "brandx").block().version()).isEqualTo(1L);
+        }
+
+        @Test
+        void updateById_unknownId_returnsEmpty() {
+            String absentId = "aaaaaaaa-aaaa-4aaa-8aaa-" + String.format("%012x", SEQ.incrementAndGet());
+            assertThat(repo.updateById(absentId, "T", "m", "<p>m</p>", "author-1", 1L)
+                    .blockOptional()).isEmpty();
         }
     }
 
@@ -177,13 +184,13 @@ class WikiPageRepositoryTest extends PostgresTestSupport {
         @Test
         void concurrentUpdatesAtSameVersion_exactlyOneWins() {
             String s = slug("cc-update");
-            repo.create(s, "T0", "v0", "<p>v0</p>", "author-0", "brandx").block();
+            WikiPage created = repo.create(s, "T0", "v0", "<p>v0</p>", "author-0", "brandx").block();
 
             int racers = 20;
             // All racers claim expectedVersion=1; only the first to land the UPDATE wins.
             Long winners = Flux.range(0, racers)
-                    .flatMap(i -> repo.updateBySlug(s, "T" + i, "v" + i, "<p>v" + i + "</p>",
-                                    "author-" + i, 1L, "brandx")
+                    .flatMap(i -> repo.updateById(created.id(), "T" + i, "v" + i, "<p>v" + i + "</p>",
+                                    "author-" + i, 1L)
                             .map(p -> 1L).defaultIfEmpty(0L))
                     .reduce(0L, Long::sum)
                     .block(Duration.ofSeconds(30));
