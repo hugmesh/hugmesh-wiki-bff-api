@@ -98,6 +98,15 @@ public class RestampTargetEnvironmentPostProcessor
     static final String ISSUER_URI_PROPERTY =
             "spring.security.oauth2.resourceserver.jwt.issuer-uri";
 
+    /** The JDBC connection Liquibase itself will use; the data guard inspects the same database. */
+    static final String LIQUIBASE_URL_PROPERTY = "spring.liquibase.url";
+
+    /** See {@link #LIQUIBASE_URL_PROPERTY}. */
+    static final String LIQUIBASE_USER_PROPERTY = "spring.liquibase.user";
+
+    /** See {@link #LIQUIBASE_URL_PROPERTY}. */
+    static final String LIQUIBASE_PASSWORD_PROPERTY = "spring.liquibase.password";
+
     /** Name of the property source this contributes, so it is identifiable in an env dump. */
     static final String SOURCE_NAME = "wikiDerivedRestampTarget";
 
@@ -148,6 +157,18 @@ public class RestampTargetEnvironmentPostProcessor
                     + " recorded checksum embeds the brand that was substituted into the SQL — set"
                     + " SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN to that brand to"
                     + " boot, and keep it set.");
+            return;
+        }
+
+        // The configuration says arm; the DATA gets a veto (issue #22). See RestampDataGuard.
+        RestampDataGuard.Verdict verdict = RestampDataGuard.check(
+                environment.getProperty(LIQUIBASE_URL_PROPERTY),
+                environment.getProperty(LIQUIBASE_USER_PROPERTY),
+                environment.getProperty(LIQUIBASE_PASSWORD_PROPERTY),
+                resolution.domain());
+        if (verdict.refuse()) {
+            log.warn("wiki-bff 007: launch domain resolves to '" + resolution.domain()
+                    + "' but the cut-over re-stamp is NOT armed — " + verdict.reason() + ".");
             return;
         }
 
