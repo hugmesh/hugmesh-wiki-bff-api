@@ -6,22 +6,28 @@
 # existing .gitlab-ci.yml `build:image` job (container build + push), ported to
 # GitHub Actions + GHCR.
 #
-# NOTHING IN THIS FILE HAS EVER EXECUTED, and this change does not produce a
-# green run. Measured 2026-09-17:
-# GET /repos/hugmesh/hugmesh-wiki-bff-api/actions/runners -> total_count 0 — no
-# self-hosted runner carrying the `hugmesh-x86` label is registered here, and
-# github-HOSTED runners are billing-blocked account-wide. Registering the runner
-# is operator-held. See .github/SELF_HOSTED_RUNNER.md.
+# STATUS (2026-10-07). This file asked for `runs-on: [self-hosted, hugmesh-x86]`.
+# No runner carries that label (the org's self-hosted runner has the labels
+# self-hosted, Linux, X64), so every dispatch sat in `queued` until GitHub's 24h
+# queue limit cancelled it (the dispatch of 2026-10-07 was cancelled by hand).
+# The label is retired; the job now runs on github-hosted `ubuntu-latest`, which
+# executes again. Still NOT a working release: the Maven chain and the secrets
+# below are a separate fix. See .github/SELF_HOSTED_RUNNER.md.
 #
-# RUNNER — must be SELF-HOSTED in-cluster (tailnet).
-# The build stage resolves the private net.hugmesh:hugmesh-commons /
-# hugmesh-parent artifacts from the in-cluster GitLab group Maven registry,
-# which is reachable only over the tailnet. A github.com-hosted runner cannot
-# reach it at all, so `ubuntu-latest` here could never have worked even with
-# every secret set.
+# RUNNER — github-hosted `ubuntu-latest`.
+# Plain `ubuntu-latest`, not the RUNS_ON repository variable: RUNS_ON points at
+# the operator's workstation runner, and a release image build must not be
+# routed there by a variable somebody set for CI.
+#
+# The Dockerfile's build stage resolves the PRIVATE net.hugmesh:hugmesh-commons
+# / hugmesh-parent artifacts (not on Maven Central) from the in-cluster GitLab
+# group Maven registry, which is reachable only over the tailnet. A github-hosted
+# runner cannot reach it, so the preflight below FAILS (by name) on the missing
+# GITLAB_* secrets until the build resolves the chain from GitHub Packages
+# instead. That Maven-chain change is separate from the runner label.
 #
 # PREREQS (one-time, org/repo settings — not something this workflow can set):
-#   - A self-hosted runner labelled `hugmesh-x86` — see .github/SELF_HOSTED_RUNNER.md
+#   - (no runner prerequisite: the job runs on github-hosted `ubuntu-latest`)
 #   - Repo/org SECRETS (all three are `secrets.`, never `vars.` — see below):
 #       GITLAB_MAVEN_TOKEN  -> read-scoped token for the GitLab group Maven registry
 #                              (passed into the image build as the BuildKit
@@ -68,9 +74,9 @@ env:
 
 jobs:
   build-and-push:
-    # Self-hosted, in-cluster (tailnet) — see the RUNNER note above and
-    # .github/SELF_HOSTED_RUNNER.md.
-    runs-on: [self-hosted, hugmesh-x86]
+    # Github-hosted; the old `hugmesh-x86` self-hosted label is retired (see the
+    # RUNNER note above and .github/SELF_HOSTED_RUNNER.md).
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -117,7 +123,7 @@ jobs:
           # Docker daemon can only fail obscurely inside setup-buildx.
           if ! command -v docker >/dev/null 2>&1; then
             echo "FATAL: no docker on this runner; the image build cannot run."
-            echo "See .github/SELF_HOSTED_RUNNER.md for the runner requirements."
+            echo "See .github/SELF_HOSTED_RUNNER.md (the runner label is retired)."
             exit 1
           fi
           if ! docker version >/dev/null 2>&1; then
