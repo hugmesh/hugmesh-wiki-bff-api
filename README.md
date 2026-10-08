@@ -36,9 +36,10 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
   LTS** (`eclipse-temurin:25`), on the shared Maven artifacts
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
   and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
-  `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The full
-  suite is green: **249/249 tests**, run against a real Postgres via Testcontainers rather
-  than an in-memory substitute.
+  `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The suite
+  holds **400** `@Test` methods (counted from source on 2026-10-07, not run for this
+  edit) and runs against a real Postgres via Testcontainers rather than an in-memory
+  substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
   server**. The browser only ever holds an **opaque `bff_`-prefixed session** (issued and
   refreshed by `user-bff`, which performs the Casdoor OIDC code→token exchange) — the user
@@ -51,13 +52,18 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
 - **Authorization is gateway-fronted + locally re-checked.** The gateway enforces the
   data-driven `gateway_route_access` floor (`ROLE_WIKI`); this service still does its own
   defence-in-depth path gate + method `@PreAuthorize` + the load-bearing
-  `WikiAccessGuard` overlay decision (see below).
-- **Data access** is Spring Data R2DBC reactive repositories (no raw SQL strings / inline
-  `@Query`), per the platform's data-access convention.
+  `WikiAccessGuard` overlay decision (see below). An MFA step-up check on the admin and
+  superadmin paths is wired but off (`app.mfa.enabled`, default `false`).
+- **Data access** is Spring Data R2DBC reactive repositories, per the platform's
+  data-access convention. Derived finders cover what they can; every other statement is a
+  `static final String` bound to `@Query`. There is no `DatabaseClient` and no inline SQL
+  in a method body.
 - **CI runs on GitLab.** The GitHub repo is pull-mirrored into the platform's in-cluster
   GitLab instance, which runs the pipeline described in
-  [CI / security pipeline](#ci--security-pipeline). Deployments run SELinux-enforcing, use
-  a per-app SCRAM Postgres role, and communicate over internal mTLS.
+  [CI / security pipeline](#ci--security-pipeline). A manual GitHub Actions workflow
+  (`release.yml`) builds the image and pushes it to GHCR. The cluster manifests in
+  `hugmesh-generator` set `seLinuxOptions` on the pod, enable mTLS (`SSL_ENABLED=true`,
+  `SSL_CLIENT_AUTH=need`) and give the database `scram-sha-256` auth.
 
 ## Three-tier architecture (write path vs. Kiwix's read-only serving)
 
@@ -112,8 +118,8 @@ The shipped surface is well beyond a skeleton. The content store, Markdown rende
 grant/timeout/ban access overlay, per-page attachments, draft→published lifecycle, and
 audit trail are all on `main`.
 
-- **Liquibase schema** (`db.changelog-master.xml` includes all six changesets):
-  - `001` — `wiki_page` (`id` UUID PK, `domain` NOT NULL, `slug`, `title`,
+- **Liquibase schema** (`db.changelog-master.xml` includes all seven changelog files):
+  - `001` — `wiki_page` (`id` varchar PK holding a UUID string, `domain` NOT NULL, `slug`, `title`,
     `content_markdown`, `content_html`, `author_subject`, `version`, `created_at`,
     `updated_at`, **UNIQUE(domain, slug)**).
   - `002` — `wiki_attachment` (`page_id` FK ON DELETE CASCADE, `filename`, `mime_type`,
@@ -130,13 +136,18 @@ audit trail are all on `main`.
     (`wiki_page` / `wiki_attachment` / `wiki_audit_log` / `wiki_access`), so the database —
     not the app — mints the id; the repositories INSERT without an id and read it back via
     `RETURNING id`.
+  - `007` — the multi-brand cut-over re-stamp (data only, no DDL). It stays `PENDING`
+    until armed; see the
+    [cut-over runbook](#cut-over-set-app_tenancy_issuers-and-redeploy--the-re-stamp-derives-its-own-target).
 - **R2DBC repositories** — domain-scoped reads, DB-generated-UUID inserts (INSERT without
   an id, `RETURNING id`), and the **version-guarded conditional UPDATE** (optimistic
   concurrency).
 - **Casdoor JWT resource server** — the canonical converter (reserved-prefix injection
-  guard + issuer-derived `DOMAIN_<x>` + fail-closed `domainOf`), single- and (opt-in)
+  guard + issuer-derived `DOMAIN_<x>` + fail-closed domain scope), single- and (opt-in)
   multi-issuer.
-- **Markdown → HTML at write** (CommonMark + GFM tables, raw HTML escaped = XSS-safe).
+- **Markdown → HTML at write** (CommonMark + GFM tables; raw HTML in the source is
+  escaped, `MarkdownRenderer` sets `escapeHtml(true)`). It does not set `sanitizeUrls`, so
+  link targets are not filtered.
 - **`WikiController`** — read (list/get) + edit (create/update) + publish + **delete**, all
   domain-scoped, author tracked from the JWT subject.
 - **`WikiAttachmentController`** — per-page binary attachments: upload, download, list,
@@ -145,8 +156,10 @@ audit trail are all on `main`.
   at request time on every read.
 - **OpenAPI / springdoc** at `/v3/api-docs` — the source for the paired
   [`hugmesh-wiki-ui`](https://github.com/hugmesh/hugmesh-wiki-ui) (✅ shipped:
-  ng-openapi-gen typed client, Playwright/BDD e2e harness, Dockerfile+nginx, CI pipeline;
-  its federation contract is wired to this BFF's `/v3/api-docs`).
+  ng-openapi-gen typed client, Playwright/BDD e2e harness, Dockerfile+nginx, CI pipeline).
+  The UI's `gen:spec` script copies this repo's committed
+  `src/main/resources/openapi/openapi.json`. `OpenApiSpecDumpTest` fails when that file
+  differs from the live spec; refresh it with `-Dopenapi.spec.write=true`.
 
 ### Publish lifecycle
 
@@ -169,10 +182,18 @@ WIKI_MANAGE = hasRole('SUPERADMIN')
 (`/bff/wiki/superadmin/**` SUPERADMIN, `/bff/wiki/admin/**` ADMIN|SUPERADMIN, the rest
 `.authenticated()`); and the controllers re-check at the method level via `@PreAuthorize`.
 
+**MFA step-up is wired and ships dark.** `SecurityConfig.stepUp` wraps the two privileged
+path groups (`/bff/wiki/superadmin/**` and `/bff/wiki/admin/**`). While `app.mfa.enabled`
+is `false` (the default) the wrapper changes nothing. Once it is `true`, those paths also
+demand the `MFA_SATISFIED` marker, which the shared converter derives from a fresh
+`mfa_satisfied_at` claim (`app.mfa.freshness-window`, default `600000` ms). The read paths
+are not step-up gated. `MfaStepUpPathGateSliceTest` covers it.
+
 The **write/manage** endpoints use **static SpEL** composites at the method level
-(`WIKI_WRITE` = ADMIN|SUPERADMIN, `WIKI_MANAGE` = SUPERADMIN). The role hierarchy edge
-`ROLE_SUPERADMIN > ROLE_ADMIN` means a cross-domain SUPERADMIN can reach ADMIN-gated write
-endpoints without being listed explicitly.
+(`WIKI_WRITE` = ADMIN|SUPERADMIN, `WIKI_MANAGE` = SUPERADMIN). The role hierarchy
+(`ROLE_SUPERADMIN > ROLE_ADMIN`, `ROLE_SUPERADMIN > ROLE_MOD`, `ROLE_SUPERADMIN >
+ROLE_USER`) means a cross-domain SUPERADMIN can reach ADMIN-gated write endpoints without
+being listed explicitly. ADMIN and MOD are siblings: neither implies the other.
 
 The **read** endpoints are different. Their `@PreAuthorize` gate is
 `WIKI_READ_AUTHENTICATED = "isAuthenticated()"` — deliberately weaker than a static
@@ -249,21 +270,17 @@ per-principal read overrides:
     migration can never disagree), falling back to `hugmesh`. It is **not necessarily a
     member of `brands`**: with 2+ brands there is no single launch domain and the fallback
     is reported, so a caller must check membership before preselecting it.
-  - `targetDomainHonoured` — whether `targetDomain` is consulted **at all**.
-    `writeDomain` reads it only when `DomainRegistry.isMultiIssuer()`, i.e. **two or more**
-    configured issuer pairs. Below that a SUPERADMIN write is stamped `default` whatever
-    the body said.
-  With **exactly one** configured pair (`app.tenancy.issuers=https://id=hugmesh`) those
-  last two combine into a live hazard: users resolve `hugmesh`, but a SUPERADMIN grant or
-  ban is stamped `default`, so `WikiAccessGuard` — which reads back
-  `activeFor(subject, "hugmesh")` — never matches it. That is the same
-  silently-ineffective ban #39 closed for 2+ brands, still open at exactly 1, and issue
-  #19's launch-domain derivation makes the single-pair mapping the first-class
-  single-brand launch shape. It is filed for a decision as **issue #21**. This endpoint
-  does not change `writeDomain` (that would turn a silent no-op into a 400 for existing
-  deployments); it makes the combination
-  *detectable* — `brands` non-empty while `targetDomainHonoured` is false — so the console
-  can warn instead of rendering a control the server discards.
+  - `targetDomainHonoured` — whether `targetDomain` is consulted **at all**. It is true
+    when `DomainRegistry.isMultiIssuer()` (two or more configured issuer pairs) **or**
+    `PrincipalDomain.soleConfiguredBrand` finds exactly one real brand
+    (`WikiBrandCatalog.snapshot`). It is false only on a back-compat single-issuer
+    deployment, where every principal is `default`, `brands` is empty and the field is
+    inert. So false now always means "nothing to pick", never "a real choice the server
+    will discard". The old hazard, `brands` non-empty while `targetDomainHonoured` is
+    false, can no longer occur: the exactly-one-pair stamp was fixed in #21.
+
+  `brands` also drops any value longer than the 64-character `domain` column
+  (`WikiLaunchDomain.isSpellableAsDomainColumn`), because the INSERT would reject it.
 - Rows transition from `active` to `revoked` but are **never hard-deleted** — the full
   history is retained for audit. A re-grant after revocation inserts a new row.
 - Precedence in `WikiAccessGuard`: an active ban or timeout **denies even a role-holder or
@@ -332,7 +349,9 @@ ADMIN of brand X can read and write **only brand X's pages**; SUPERADMIN is the
 cross-domain bypass.
 
 If the JWT issuer cannot be resolved to a known domain (e.g., a token from an unconfigured
-issuer), `domainOf` returns the sentinel string `__deny__` rather than throwing. Because
+issuer), `PrincipalDomain.forScope` returns the sentinel string `__deny__` rather than
+throwing (the registry's `domainOf` answers `null` for an unknown issuer; `forScope` turns
+that into the sentinel for every non-SUPERADMIN). Because
 `__deny__` matches no real domain in the database, the request returns an empty result or a
 404 rather than leaking another domain's data. This is the fail-closed behaviour: an
 unresolvable domain produces a safe empty result, not an error that could be exploited to
@@ -502,9 +521,18 @@ this is that same already-multi-brand cluster. Use the manual override there.
 > SUPERADMIN-authored-`default`-row hazard is a property of the **data**; every rule above
 > is a property of the **configuration**, and the data outlives the shape. If you run two
 > brands, let a SUPERADMIN author content, then *narrow* `APP_TENANCY_ISSUERS` back to one
-> pair, the derivation arms — 007 is still `PENDING`, it never ran under the refused shape —
-> and sweeps those rows into the surviving brand. Run the pre-flight below before any
-> narrowing, not just before a first cut-over.
+> pair, 007 is still `PENDING` (it never ran under the refused shape) and the single
+> surviving pair looks like a first cut-over. `RestampDataGuard` now gives the database a
+> veto. Before arming, it reads the four domain-bearing tables, and if any holds a row in a
+> domain that is neither `default` nor the target, it refuses to arm and logs a WARN
+> (`... but the cut-over re-stamp is NOT armed — the database already holds rows in a domain
+> other than ...`). It allows the boot when 007 is already recorded in `databasechangelog`
+> (the derived target must keep being published, see below), when the tables do not exist
+> yet, and when it cannot connect (Liquibase dials the same URL moments later). Once
+> connected, any failure to inspect refuses to arm. **The residual case remains:** a
+> cluster whose only authored rows are SUPERADMIN `default` rows shows no foreign domain
+> and looks like a legacy one. Run the pre-flight below before any narrowing, not just
+> before a first cut-over, and supply the override if the sweep is intended.
 
 **Manual override still works** and is the escape hatch for both refused shapes — set
 `spring.liquibase.parameters.wiki.restamp.target.domain` (or the
@@ -512,8 +540,9 @@ this is that same already-multi-brand cluster. Use the manual override there.
 derivation. The value must still match `^[a-z0-9-]{1,64}$` and must not be `default`.
 
 Whichever path you use, the boot log states the outcome in one line — `launch domain
-derived as '<brand>' ... Arming the cut-over re-stamp`, or `... is NOT armed — <reason>`.
-Read it: an un-armed run is otherwise silent by design.
+derived as '<brand>' ... Arming the cut-over re-stamp`, `... is NOT armed — <reason>`, or
+`re-stamp target explicitly set to '<brand>' ... The explicit value wins`. Read it: an
+un-armed run is otherwise silent by design.
 
 **Renaming the brand after the cut-over refuses the next startup, on purpose.** Editing
 `APP_TENANCY_ISSUERS` from `=brand-a` to `=brand-b` changes the derived parameter, which
@@ -575,8 +604,8 @@ that, honestly:
 violates `uq_wiki_page_domain_slug` or `uq_wiki_access_active` and the run throws. The
 transaction rolls back cleanly — every row keeps its old stamp and the changeset stays
 `PENDING`, so nothing is half-migrated — but because Liquibase runs at startup you will see
-this as **the application failing to boot**, not as a migration warning. One `default` row
-per group is the safe state:
+this as **the application failing to boot**, not as a migration warning. Each query should
+return exactly one row, reading `default`:
 
 ```sh
 psql -c "SELECT domain, count(*) FROM wiki_page   GROUP BY domain;"
@@ -617,19 +646,23 @@ nothing to roll back to yet. If anything has been deployed *since* the cut-over,
 
 #### What the migration costs you: SUPERADMIN writes to migrated rows
 
-After the re-stamp a **SUPERADMIN can no longer write the rows it moved**. `forScope`
-returns `null` for a SUPERADMIN (the cross-domain *read* bypass) and every write path
-coerces that `null` to `DEFAULT_DOMAIN` (`WikiPageRepository` create/update/publish/delete,
-`WikiAttachmentRepository`, `WikiAuditLogRepository`, `WikiAccessRepository`), so a
-SUPERADMIN write is literally `... WHERE domain = 'default'` and there are no `default` rows
-left. On a migrated page a SUPERADMIN's update answers a nonsense **409**, their publish a
-**404**, and their delete answers **204 having deleted nothing**.
+After the re-stamp a **SUPERADMIN can no longer do everything to the rows it moved.**
+`forScope` returns `null` for a SUPERADMIN (the cross-domain *read* bypass). Three page
+operations now resolve the page in the caller's scope and then act **by that row's id**,
+so they reach a migrated page: update and publish (#33, operator decision 59) and delete
+(#15). Four paths still coerce the `null` scope to `DEFAULT_DOMAIN`, so a SUPERADMIN write
+there is stamped, or matched, `default`:
 
-The brand's own scoped ADMIN/EDITOR principals *do* regain full write access to every
-migrated row — that is what makes the brand the right target. The SUPERADMIN gap is issue
-**#15** (SUPERADMIN writes must use the `null` cross-domain scope rather than coercing to
-`DEFAULT_DOMAIN`), and **#15 must land before a SUPERADMIN can administer a post-cut-over
-deployment**.
+- page **create** (`WikiPageRepository.create`) stamps the new page `default`;
+- attachment **upload** stamps the attachment `default` although its page sits in the
+  brand, and attachment reads scope on the attachment's own `domain`, so the brand's
+  admins do not see it;
+- attachment **delete** matches `domain = 'default'`, finds no row and answers **404**;
+- the audit rows written by those paths are stamped `default`.
+
+The brand's own scoped ADMIN principals *do* regain full write access to every migrated
+row — that is what makes the brand the right target. This remaining gap has no issue
+number in this README; the 007 header calls it "the residual SUPERADMIN gap".
 
 Arm this only on a cluster that is **single-issuer today**. On an already-multi-brand
 cluster a `default` row can also come from a SUPERADMIN write (same coercion as above), and
@@ -660,22 +693,30 @@ the un-armed, armed, rollback, tag-timing, forward-collision and SUPERADMIN-cost
   with a **TLSv1.3** floor — so a caller not deployed and signed by the platform's PKI is
   rejected at the handshake.
 - **OpenAPI gating.** `/v3/api-docs` and Swagger UI are **public under the `dev`/`test`
-  profiles** (so `gen:fetch` / ng-openapi-gen and the docs pipeline can fetch the spec
+  profiles** (so the docs pipeline and `OpenApiSpecDumpTest` can fetch the spec
   without a token) but require **ROLE_ADMIN|SUPERADMIN in prod** (the `!dev & !test` filter
   chain), so the API contract is never publicly reachable in a production deployment.
 
 ## CI / security pipeline
 
-CI runs on **GitLab only**. The GitHub repo is pull-mirrored into the platform's in-cluster
-GitLab instance (`mirror_trigger_builds=true`), and `.gitlab-ci.yml` runs on every push or
-mirror-sync using a privileged x86 runner. A manual-only `release.yml` GitHub Actions
-workflow (`workflow_dispatch`) is also included, for building and pushing the image to GHCR
-once the required repo secrets are configured — see the workflow file for details.
+The test pipeline runs on **GitLab**. The GitHub repo is pull-mirrored into the platform's
+in-cluster GitLab instance (`mirror_trigger_builds=true`, per the comment in
+`.gitlab-ci.yml`), and `.gitlab-ci.yml` runs on the privileged x86 runner for pushes to
+the default branch, merge requests and tags (the `build:image` job runs only for the
+default branch and tags).
+
+A manual-only `release.yml` GitHub Actions workflow (`workflow_dispatch`) builds the image
+and pushes it to GHCR. It runs on a GitHub-hosted `ubuntu-latest` runner and needs the
+**repository** secret `PACKAGES_READ_TOKEN` (a classic PAT with `read:packages`); its
+preflight step fails by name when the secret is missing or cannot read the
+`hugmesh-build-config`, `hugmesh-parent` and `hugmesh-commons` packages. The image is
+tagged with the first 12 characters of the commit SHA, and `latest` moves only when the
+run is on `main`.
 
 ```mermaid
 flowchart LR
     push(["git push / mirror sync"])
-    test["test<br/>./mvnw -B -s settings.xml test<br/>(docker:dind + Testcontainers Postgres,<br/>JUnit surefire reports)"]
+    test["test<br/>./mvnw -B -s settings.xml verify<br/>(docker:dind + Testcontainers Postgres,<br/>JUnit surefire reports)"]
     sca["pentest:sca<br/>OWASP Dependency-Check SCA"]
     dast["pentest:dast<br/>ZAP + nuclei + escalation probes"]
     build["build:image<br/>push to GitLab registry<br/>(SHA tag + branch tag)"]
@@ -688,16 +729,19 @@ flowchart LR
     style dast stroke-dasharray:4,stroke:#888
 ```
 
-- **test** — runs `./mvnw -B -s settings.xml test` inside `maven:3.9-eclipse-temurin-25`,
+- **test** — runs `./mvnw -B -s settings.xml verify` inside `maven:3.9-eclipse-temurin-25`,
   with a `docker:27-dind` service attached so the full-context (`@SpringBootTest`) tests
   can spin up a real Postgres via Testcontainers (the commons `PostgresTestSupport` base),
-  and publishes surefire JUnit reports.
+  and publishes surefire JUnit reports. `verify` runs the suite and then PMD, Checkstyle
+  and SpotBugs, which `hugmesh-parent` binds to that phase. The job ends with
+  `git diff --exit-code`: a build that rewrote a checked-in file (for example
+  `openapi.json`) fails.
 - **build:image** — needs only `test` (not the pentest jobs); builds and pushes the
   container image to the in-cluster GitLab registry with both an immutable SHA tag and a
   moving branch tag. Images carry no key material — all key material is supplied at first
   boot from external storage.
-- **pentest:sca / pentest:dast** — each `needs: [test]` and run in parallel (not
-  sequentially), via `extends:` from the centralized stage template in
+- **pentest:sca / pentest:dast** — each `needs: [test]`, run on the default branch and on
+  merge requests, and run in parallel (not sequentially), via `extends:` from the centralized stage template in
   [`hugmesh-generator`](https://github.com/hugmesh/hugmesh-generator)
   (`/tests/pentest/ci/pentest-stage.gitlab-ci.yml`). `.pentest-sca` runs OWASP
   Dependency-Check SCA, and `.pentest-dast-baseline` runs the shared `run-pentest.sh`
@@ -708,9 +752,11 @@ flowchart LR
 - **Local reproduction (`Makefile`)** — `make pentest` runs the same two checks locally:
   `make pentest-sca` (OWASP Dependency-Check via Docker, falling back to `./mvnw` when
   Docker is unavailable) and `make pentest-dast` (the shared `run-pentest.sh` harness
-  against `DAST_TARGET_URL`, skipped non-fatally when no target/harness is available).
-  Both targets are self-contained and exit `0` even with nothing configured, so they're
-  safe to run on any dev machine without CI credentials.
+  against `DAST_TARGET_URL`). `pentest-dast` skips with exit `0` when no target is set or
+  the harness is missing (`PENTEST_HARNESS_DIR`, default
+  `../hugmesh-generator/tests/pentest`). `pentest-sca` always runs the scan and fails the
+  build on a finding at or above `PENTEST_FAIL_CVSS` (default `9`). It runs with
+  `-DautoUpdate=true`.
 
 ## Build / test
 
@@ -718,7 +764,11 @@ flowchart LR
 ./mvnw test                          # the full suite: unit + slice + full-context tests
 ./mvnw -s settings.xml test          # same, resolving hugmesh-commons from GitLab Maven
                                      # (only needed if it isn't already in ~/.m2)
+./mvnw -s settings.xml verify        # what CI runs: the suite, then PMD, Checkstyle, SpotBugs
 ```
+
+`CutOverRunbookReadmeTest` reads this README and pins the layout of the cut-over runbook
+(see the comment in that class). Run it after you edit the runbook.
 
 The full-context (`@SpringBootTest`) tests run against a **real Postgres via
 Testcontainers** (the commons `PostgresTestSupport` base) — rather than an in-memory H2
@@ -754,8 +804,9 @@ tenancy code. There are two de-duplication moves:
    management is inherited transitively). The parent consolidates the reactive-BFF
    `<dependencies>` (webflux/actuator/security/oauth2-resource-server/validation,
    R2DBC + Liquibase + JDBC, springdoc, the full test stack) and the
-   `dependencyManagement` for `hugmesh-commons`. Only the **wiki-specific** dependencies
-   stay in this POM: `commonmark` + `commonmark-ext-gfm-tables`.
+   `dependencyManagement` for `hugmesh-commons`. This POM declares `hugmesh-commons` (and
+   its `tests` jar, for `PostgresTestSupport`) plus the **wiki-specific** dependencies
+   `commonmark` + `commonmark-ext-gfm-tables` (pinned at `0.24.0`).
 
 2. **Shared security/tenancy/web →** `net.hugmesh:hugmesh-commons:2.1.0`.
    The local copies of `security.{Roles,CasdoorAuthorities,DomainRegistry,DomainScope}`,
@@ -770,8 +821,8 @@ tenancy code. There are two de-duplication moves:
    **What stays per-repo:** `security.PrincipalDomain` is a `@Component` with a
    constructor-injected `DomainRegistry` and the fail-closed `__deny__` sentinel logic in
    `forScope(jwt)`. It is a distinct class from the commons `PrincipalDomain` value object
-   and is intentionally kept here. `config.SecurityConfig` (route matchers, CSRF/cookie/
-   header policy) and `config.SecuritySliceSupport` for tests are also local.
+   and is intentionally kept here. `config.SecurityConfig` (route matchers, CSRF-off and
+   header policy, MFA step-up) and `config.SecuritySliceSupport` for tests are also local.
 
    > Scope note: `hugmesh-commons` 2.1.0 carries shared **security/tenancy/web** only. The
    > newer [`hugmesh-auth-core`](https://github.com/hugmesh/hugmesh-auth-core) library
@@ -787,7 +838,9 @@ tenancy code. There are two de-duplication moves:
 ### Resolving the private `hugmesh-commons` artifact
 
 `hugmesh-commons` is **not on Maven Central** — it lives in the platform's GitLab Maven
-Package Registry. There are two resolution paths; neither requires secrets in git:
+Package Registry, and the release chain also publishes it (with `hugmesh-parent` and
+`hugmesh-build-config`) to GitHub Packages. There are three resolution paths; none
+requires secrets in git:
 
 - **Local dev:** `hugmesh-parent` + `hugmesh-commons` are `mvn install`ed into `~/.m2`, so
   a plain `./mvnw test` resolves them locally.
@@ -796,9 +849,15 @@ Package Registry. There are two resolution paths; neither requires secrets in gi
   injected by GitLab at runtime and is never committed. The [`Dockerfile`](Dockerfile)
   multi-stage build runs `./mvnw -s settings.xml package` with the token supplied as a
   **BuildKit secret** (`--mount=type=secret`), so it never appears in the image layer
-  history. The CI `test` job passes the token as an environment variable into the build
-  container; the `build:image` job passes `--secret id=ci_job_token,env=CI_JOB_TOKEN`
-  along with the `CI_API_V4_URL` and `GITLAB_GROUP_ID` build args.
+  history. GitLab sets `CI_JOB_TOKEN` in the `test` job's environment; the `build:image`
+  job passes `--secret id=ci_job_token,env=CI_JOB_TOKEN` along with the `CI_API_V4_URL` and
+  `GITLAB_GROUP_ID` build args.
+- **GitHub Actions (`release.yml`):** the workflow mounts the BuildKit secret
+  `packages_read_token` (from the repository secret `PACKAGES_READ_TOKEN`). When the
+  `Dockerfile` finds that secret it builds with
+  [`.github/maven-ci-settings.xml`](.github/maven-ci-settings.xml) and resolves the
+  libraries from GitHub Packages instead of the GitLab registry. A secret that is mounted
+  but empty is an error, not a fall-back to GitLab.
 
 ## Security fixes
 
@@ -844,6 +903,12 @@ for transparency rather than deleted from the history:
   `wiki_attachment` FK `ON DELETE CASCADE` (nothing is deleted ahead of the page); a
   zero-row delete is a **404**, never a 204; and the audit row is stamped with the brand
   the page actually lived in.
+- ~~**A SUPERADMIN page update answered a self-contradicting 409, and a publish answered
+  404, for a page outside `default`.**~~ **Fixed (#33, operator decision 59):**
+  `WikiService.update` and `.publish` resolve the page in the caller's scope and then act
+  **by that row's id** (`WikiPageRepository.updateById` / `.publishById`), so a SUPERADMIN
+  reaches the page it just read. A stale `expectedVersion` is still a 409, now decided by a
+  re-read on the same id, and the audit row carries the page's own brand.
 
 ## Roadmap / out of repo
 
@@ -858,17 +923,18 @@ The items below are clearly marked future work. **None of this is shipped in thi
   authorization.
 - ✅ **[`hugmesh-wiki-ui`](https://github.com/hugmesh/hugmesh-wiki-ui)** (out of repo,
   shipped on main): the paired Angular client — ng-openapi-gen typed client generated from
-  this BFF's `/v3/api-docs`, federation contract wired, Playwright/BDD e2e harness,
-  Dockerfile+nginx, CI pipeline.
+  this repo's committed `openapi.json`, native-federation remote, Playwright/BDD e2e
+  harness, Dockerfile+nginx, CI pipeline.
 - 🚧 **Pen-test standard maturation**: the SCA + ZAP DAST stages are present but
   **advisory** (`allow_failure`) and the DAST baseline is only meaningful against a
   stood-up test environment; non-advisory gating + k6 load testing are part of the
   platform's pen-test rollout, still in flight across the platform's service repos.
-- 🔭 **Platform security backlog / step-up**: the platform-wide item to move UI bearer
-  tokens out of `localStorage`, and Casdoor MFA / step-up enforcement
-  (`gateway_route_access.mfa_required`, `amr`/`acr` → `MFA_SATISFIED`), are
-  design-complete or in-flight platform features. If this BFF later participates in
-  step-up-gated routes it will be noted here — it is **not** wired today.
+- 🚧 **Platform security backlog / step-up**: this BFF's half of MFA step-up is built
+  (`SecurityConfig.stepUp`, see [Role model](#role-model-platform-cascade-superadmin--admin--mod--user))
+  but ships dark: it does nothing until the platform sets `app.mfa.enabled=true`. The
+  platform-wide parts (Casdoor `amr`/`acr` → `MFA_SATISFIED`, `gateway_route_access.mfa_required`,
+  and moving UI bearer tokens out of `localStorage`) live in other repos and are not
+  checked here.
 
 ## Scope and current limitations
 
@@ -886,25 +952,19 @@ boundaries of this repo, not incomplete code within it:
 - **`hugmesh-wiki-ui` (the paired Angular frontend) is a separate repository** — this
   service exposes an OpenAPI contract at `/v3/api-docs` for it to consume, but no UI code
   lives here.
-- **PMD / Checkstyle / SpotBugs are configured** (inherited from `hugmesh-parent`, no
-  local config needed), **but none of the three currently gate this repo's CI.** Running
-  them directly against the code in this repo:
-  - `./mvnw checkstyle:check` and `./mvnw pmd:check` both pass clean (0 violations).
-  - `./mvnw spotbugs:check` reports **4** `EI_EXPOSE_REP2` findings
-    (`WikiAccessDto$AccessList`, `WikiAccessGuard`, `WikiAttachment`, `WikiDto$PageList`).
-    These are the same benign constructor-injection / record-accessor pattern the parent's
-    exclude filter already tolerates elsewhere in the platform; they show up here because
-    this repo organizes code by **feature** (`wikibff.access`, `wikibff.wiki`) rather than
-    by **layer**, and the shared filter's class-name-suffix rule doesn't cover a
-    `Guard`-suffixed class, nor DTOs that live directly in a feature package rather than a
-    `.dto`/`.entity`/`.model` subpackage.
-  - All three analyzers bind to the Maven **`verify`** phase. This repo's CI
-    (`.gitlab-ci.yml`) only runs `./mvnw test`, and the Docker build only runs
-    `./mvnw package -DskipTests` — neither reaches `verify`, so none of the three run in
-    CI today. Wiring `verify` in would keep PMD/Checkstyle passing but would make the
-    SpotBugs job fail on the 4 findings above.
-  - There's no ESLint/Prettier/Spotless in this repo — it's Java-only, with no frontend
-    code, and no repo-local override of the inherited rulesets.
+- **PMD / Checkstyle / SpotBugs gate CI.** `hugmesh-parent` configures all three and binds
+  them to the Maven **`verify`** phase, and the GitLab `test` job runs `./mvnw -B -s
+  settings.xml verify`. The Docker build runs `./mvnw package -DskipTests`, which stops
+  before `verify`. Run on `origin/main` on 2026-10-07 with `./mvnw -o -B verify
+  -DskipTests`: PMD passed, Checkstyle reported 0 violations, SpotBugs reported 0 bugs.
+  - The repo keeps one local SpotBugs exclusion, `spotbugs/exclude-filter.xml`, wired
+    through `<excludeFilterFiles>` in `pom.xml`. It suppresses `EI_EXPOSE_REP2` for
+    `WikiAccessGuard` only, and only for an injected collaborator: a `byte[]`, `char[]`,
+    `List`, `Map`, `Set`, `Collection` or `Date` field is still reported. The shared filter
+    misses this class because the repo is organised by **feature** (`wikibff.access`), not
+    by layer, and `Guard` is not one of its class-name suffixes.
+  - There is no ESLint/Prettier/Spotless in this repo. It is Java-only, with no frontend
+    code.
 
 ## Contributing
 
