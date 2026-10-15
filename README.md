@@ -664,6 +664,30 @@ the un-armed, armed, rollback, tag-timing, forward-collision and SUPERADMIN-cost
   without a token) but require **ROLE_ADMIN|SUPERADMIN in prod** (the `!dev & !test` filter
   chain), so the API contract is never publicly reachable in a production deployment.
 
+- **MFA step-up on the privileged paths, and how a refusal is signalled.**
+  `/bff/wiki/superadmin/**` and `/bff/wiki/admin/**` are wrapped in
+  `SecurityConfig.stepUp`: while `app.mfa.enabled=false` (the default) that wrapper is a
+  no-op; when the flag is on they additionally demand the `MFA_SATISFIED` authority that
+  `CasdoorAuthorities` derives only from a fresh `mfa_satisfied_at` claim. A step-up refusal
+  used to be a bare `403`, byte-identical to a role refusal, so a UI could not know whether an
+  MFA challenge could help (hugmesh-wiki-bff-api#35). It is now rendered by
+  `WikiStepUpAccessDeniedHandler` **only** when the role rule granted and the `MFA_SATISFIED`
+  leg denied:
+
+  | | |
+  | --- | --- |
+  | **Status** | `403`, unchanged |
+  | **Header** | `X-Step-Up-Required: X-Wiki-StepUp` (the platform `X-<flavour>-StepUp` shape; a flavour name, not a request header this service reads) |
+  | **Body** | `{"error":"<verb> requires step-up re-authentication (present X-Wiki-StepUp)"}`, `<verb>` being `wiki management` (superadmin group) or `wiki administration` (admin group); `requires step-up` is the legacy phrase for clients without the header |
+
+  There is no signal on a role `403`, a `401`, a call that is granted, the ordinary
+  `/bff/wiki/**` read floor, or anything at all while the flag is off. Every non-step-up `403`
+  keeps Spring's own response (the RFC 6750 `WWW-Authenticate: Bearer error="insufficient_scope"`
+  challenge, empty body): the handler delegates to `BearerTokenServerAccessDeniedHandler`,
+  which is what Spring resolves for a chain with `oauth2ResourceServer`, and
+  `StepUpAccessDeniedWiringTest` compares the two responses at runtime.
+  `StepUpSignalSliceTest` drives all of the above through both profile chains.
+
 ## CI / security pipeline
 
 CI runs on **GitLab only**. The GitHub repo is pull-mirrored into the platform's in-cluster
@@ -867,8 +891,9 @@ The items below are clearly marked future work. **None of this is shipped in thi
 - 🔭 **Platform security backlog / step-up**: the platform-wide item to move UI bearer
   tokens out of `localStorage`, and Casdoor MFA / step-up enforcement
   (`gateway_route_access.mfa_required`, `amr`/`acr` → `MFA_SATISFIED`), are
-  design-complete or in-flight platform features. If this BFF later participates in
-  step-up-gated routes it will be noted here — it is **not** wired today.
+  design-complete or in-flight platform features. This BFF's two privileged path groups
+  already carry the step-up gate and signal (see *Security posture*), dark until the
+  platform flips `app.mfa.enabled`.
 
 ## Scope and current limitations
 

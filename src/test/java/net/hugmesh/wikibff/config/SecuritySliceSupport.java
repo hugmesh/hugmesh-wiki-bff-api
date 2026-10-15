@@ -53,7 +53,7 @@ abstract class SecuritySliceSupport {
             Object... controllers) {
 
         SecurityConfig config = new SecurityConfig(registry, tenantResolver);
-        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http());
+        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http(), config.wikiStepUpAccessDeniedHandler());
         WebFilterChainProxy securityFilter = new WebFilterChainProxy(chain);
 
         return WebTestClient.bindToController(controllers)
@@ -83,11 +83,30 @@ abstract class SecuritySliceSupport {
             Object... controllers) {
 
         SecurityConfig config = new SecurityConfig(registry, tenantResolver, true, 600_000L);
-        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http());
+        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http(), config.wikiStepUpAccessDeniedHandler());
         WebFilterChainProxy securityFilter = new WebFilterChainProxy(chain);
 
         return WebTestClient.bindToController(controllers)
                 .webFilter(securityFilter)
+                .build();
+    }
+
+    /**
+     * Like {@link #mfaSliceClient} but routed through {@link SecurityConfig#devFilterChain}
+     * (the {@code dev}/{@code test} profile chain) instead of the production one. Both chains
+     * install the step-up access-denied handler; a test that wants to prove neither lost it
+     * has to be able to drive both.
+     */
+    static WebTestClient mfaDevSliceClient(
+            DomainRegistry registry,
+            ObjectProvider<ReactiveAuthenticationManagerResolver<ServerWebExchange>> tenantResolver,
+            Object... controllers) {
+
+        SecurityConfig config = new SecurityConfig(registry, tenantResolver, true, 600_000L);
+        SecurityWebFilterChain chain = config.devFilterChain(ServerHttpSecurity.http(),
+                config.wikiStepUpAccessDeniedHandler());
+        return WebTestClient.bindToController(controllers)
+                .webFilter(new WebFilterChainProxy(chain))
                 .build();
     }
 
