@@ -44,11 +44,16 @@ public class ApiExceptionHandler {
      *
      * @param ex the {@code ApiException} thrown by a controller or service
      * @return a {@code ResponseEntity} with the exception's HTTP status and a body of
-     *         {@code {"error": message}}
+     *         {@code {"error": message}}, plus the {@code X-Step-Up-Required} header when (and
+     *         only when) {@code ex} is a {@link StepUpRequiredException}
      */
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<Map<String, Object>> handle(ApiException ex) {
-        return ResponseEntity.status(ex.status()).body(Map.of("error", ex.getMessage()));
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(ex.status());
+        if (ex instanceof StepUpRequiredException stepUp) {
+            response = response.header(StepUpRequiredException.SIGNAL_HEADER, stepUp.retryHeader());
+        }
+        return response.body(Map.of("error", ex.getMessage()));
     }
 
     /**
