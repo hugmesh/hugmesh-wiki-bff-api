@@ -37,8 +37,8 @@ library — see [Shared commons library](#shared-commons-library-hugmesh-parent-
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
   and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
   `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The full
-  suite is green: **249/249 tests**, run against a real Postgres via Testcontainers rather
-  than an in-memory substitute.
+  suite runs against a real Postgres via Testcontainers rather than an in-memory
+  substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
   server**. The browser only ever holds an **opaque `bff_`-prefixed session** (issued and
   refreshed by `user-bff`, which performs the Casdoor OIDC code→token exchange) — the user
@@ -699,7 +699,7 @@ once the required repo secrets are configured — see the workflow file for deta
 ```mermaid
 flowchart LR
     push(["git push / mirror sync"])
-    test["test<br/>./mvnw -B -s settings.xml test<br/>(docker:dind + Testcontainers Postgres,<br/>JUnit surefire reports)"]
+    test["test<br/>./mvnw -B -s settings.xml verify<br/>(docker:dind + Testcontainers Postgres,<br/>JUnit surefire reports)"]
     sca["pentest:sca<br/>OWASP Dependency-Check SCA"]
     dast["pentest:dast<br/>ZAP + nuclei + escalation probes"]
     build["build:image<br/>push to GitLab registry<br/>(SHA tag + branch tag)"]
@@ -712,10 +712,13 @@ flowchart LR
     style dast stroke-dasharray:4,stroke:#888
 ```
 
-- **test** — runs `./mvnw -B -s settings.xml test` inside `maven:3.9-eclipse-temurin-25`,
+- **test** — runs `./mvnw -B -s settings.xml verify` inside `maven:3.9-eclipse-temurin-25`,
   with a `docker:27-dind` service attached so the full-context (`@SpringBootTest`) tests
   can spin up a real Postgres via Testcontainers (the commons `PostgresTestSupport` base),
-  and publishes surefire JUnit reports.
+  and publishes surefire JUnit reports. `verify` is the phase PMD, Checkstyle and SpotBugs
+  bind to, so the job runs all three after the tests (see
+  [Scope and current limitations](#scope-and-current-limitations)). It then fails if the
+  build rewrote any committed file (`git diff --exit-code`).
 - **build:image** — needs only `test` (not the pentest jobs); builds and pushes the
   container image to the in-cluster GitLab registry with both an immutable SHA tag and a
   moving branch tag. Images carry no key material — all key material is supplied at first
@@ -911,25 +914,21 @@ boundaries of this repo, not incomplete code within it:
 - **`hugmesh-wiki-ui` (the paired Angular frontend) is a separate repository** — this
   service exposes an OpenAPI contract at `/v3/api-docs` for it to consume, but no UI code
   lives here.
-- **PMD / Checkstyle / SpotBugs are configured** (inherited from `hugmesh-parent`, no
-  local config needed), **but none of the three currently gate this repo's CI.** Running
-  them directly against the code in this repo:
-  - `./mvnw checkstyle:check` and `./mvnw pmd:check` both pass clean (0 violations).
-  - `./mvnw spotbugs:check` reports **4** `EI_EXPOSE_REP2` findings
-    (`WikiAccessDto$AccessList`, `WikiAccessGuard`, `WikiAttachment`, `WikiDto$PageList`).
-    These are the same benign constructor-injection / record-accessor pattern the parent's
-    exclude filter already tolerates elsewhere in the platform; they show up here because
-    this repo organizes code by **feature** (`wikibff.access`, `wikibff.wiki`) rather than
-    by **layer**, and the shared filter's class-name-suffix rule doesn't cover a
-    `Guard`-suffixed class, nor DTOs that live directly in a feature package rather than a
-    `.dto`/`.entity`/`.model` subpackage.
-  - All three analyzers bind to the Maven **`verify`** phase. This repo's CI
-    (`.gitlab-ci.yml`) only runs `./mvnw test`, and the Docker build only runs
-    `./mvnw package -DskipTests` — neither reaches `verify`, so none of the three run in
-    CI today. Wiring `verify` in would keep PMD/Checkstyle passing but would make the
-    SpotBugs job fail on the 4 findings above.
+- **PMD / Checkstyle / SpotBugs are configured and gate this repo's CI** (inherited from
+  `hugmesh-parent`, no local config needed; the one repo-local addition is the SpotBugs
+  exclude filter `spotbugs/exclude-filter.xml`, wired in `pom.xml`).
+  - All three bind to the Maven **`verify`** phase as `check` executions
+    (`pmd-analysis`, `checkstyle-analysis`, `spotbugs-analysis`), and the CI `test` job in
+    `.gitlab-ci.yml` runs `./mvnw -B -s settings.xml verify`, so they run on the default
+    branch, on merge requests and on tags.
+    Run them locally with `./mvnw verify -DskipTests`; on `main` that reports 0 Checkstyle
+    violations and `BugInstance size is 0` for SpotBugs. They gate CI since PR #10, which
+    cleared the four `EI_EXPOSE_REP2` SpotBugs findings that had kept them out of CI
+    (issue #1).
+  - The Docker build still runs only `./mvnw package -DskipTests`; it does not run the
+    analyzers, which is fine because it `needs` the `test` job.
   - There's no ESLint/Prettier/Spotless in this repo — it's Java-only, with no frontend
-    code, and no repo-local override of the inherited rulesets.
+    code, and no repo-local override of the inherited rulesets beyond that one exclude filter.
 
 ## Contributing
 
