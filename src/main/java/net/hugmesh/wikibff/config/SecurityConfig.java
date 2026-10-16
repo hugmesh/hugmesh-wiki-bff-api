@@ -32,6 +32,8 @@ import net.hugmesh.commons.security.CasdoorAuthorities;
 import net.hugmesh.commons.security.DomainRegistry;
 import net.hugmesh.commons.security.Roles;
 import net.hugmesh.wikibff.security.PrincipalDomain;
+import net.hugmesh.wikibff.security.WikiStepUpAccessDeniedHandler;
+import net.hugmesh.wikibff.security.WikiStepUpGate;
 
 /**
  * Casdoor-aware OAuth2 resource-server security for the wiki BFF (reactive
@@ -219,7 +221,8 @@ public class SecurityConfig {
         // app.mfa.enabled is off (that is exactly what .hasRole delegates to), plus the
         // MFA_SATISFIED marker once the platform turns MFA on.
         ex.pathMatchers("/bff/wiki/superadmin/**").access(
-                stepUp(AuthorityReactiveAuthorizationManager.hasRole("SUPERADMIN")));
+                stepUp(AuthorityReactiveAuthorizationManager.hasRole("SUPERADMIN"),
+                        WikiStepUpGate.Surface.SUPERADMIN));
         // The write/publish console seam — ADMIN (or the cross-domain SUPERADMIN
         // super-role) end-to-end. Admins reach it via the converter's ROLE_ADMIN with
         // no ROLE_WIKI needed; SUPERADMIN reaches it via the role hierarchy edge. The
@@ -227,7 +230,8 @@ public class SecurityConfig {
         // while app.mfa.enabled is off (what .hasAnyRole delegates to), plus the
         // MFA_SATISFIED marker once the platform turns MFA on.
         ex.pathMatchers("/bff/wiki/admin/**").access(
-                stepUp(AuthorityReactiveAuthorizationManager.hasAnyRole("ADMIN", "SUPERADMIN")));
+                stepUp(AuthorityReactiveAuthorizationManager.hasAnyRole("ADMIN", "SUPERADMIN"),
+                        WikiStepUpGate.Surface.ADMIN));
         // The whole wiki read surface — the ROLE_WIKI floor is enforced at the gateway,
         // so .authenticated() proves authentication here. The exact WIKI_READ composite
         // (admin|superadmin|(MOD AND WIKI)) is re-checked at the method level
@@ -259,12 +263,22 @@ public class SecurityConfig {
      * 401 at the base rule, never a step-up 403). COPIED from the landed
      * hugmesh-forum-bff-api precedent so the two BFFs enforce the flag identically.
      *
+     * <p><b>It also RECORDS which conjunct denied</b> (hugmesh-wiki-bff-api#35). When
+     * {@code base} has granted and the marker leg refuses, {@code surface} is stamped on the
+     * exchange ({@link WikiStepUpGate#recordDenial}) so {@link WikiStepUpAccessDeniedHandler}
+     * can render 403 plus {@code X-Step-Up-Required: X-Wiki-StepUp} instead of a bare 403
+     * that is indistinguishable from "you are not an admin". What is denied does not move: the
+     * recording happens strictly AFTER the decision, on the deny branch only. A role denial
+     * never reaches the recording line.
+     *
      * @param base the role/authentication rule this path already enforced
+     * @param surface which privileged path group this wrapper guards, for the refusal wording
      * @return {@code base} unchanged while MFA is dark; otherwise {@code base} AND the
      *         {@link Roles#MFA_SATISFIED} marker
      */
     private ReactiveAuthorizationManager<AuthorizationContext> stepUp(
-            ReactiveAuthorizationManager<AuthorizationContext> base) {
+            ReactiveAuthorizationManager<AuthorizationContext> base,
+            WikiStepUpGate.Surface surface) {
         if (!mfaEnabled) {
             return base;
         }
@@ -273,7 +287,26 @@ public class SecurityConfig {
         return (authentication, context) -> base.authorize(authentication, context)
                 .flatMap(result -> result.isGranted()
                         ? mfaMarker.authorize(authentication, context)
+                                .doOnNext(stepUpResult -> {
+                                    if (!stepUpResult.isGranted()) {
+                                        WikiStepUpGate.recordDenial(context.getExchange(), surface);
+                                    }
+                                })
                         : Mono.just(result));
+    }
+
+    /**
+     * The chain-wide access-denied renderer, installed on BOTH profile chains so the two
+     * cannot drift. A PASS-THROUGH for every denial except the one {@link #stepUp} recorded as
+     * a step-up refusal — see {@link WikiStepUpAccessDeniedHandler}. Stateless; taken as a
+     * METHOD PARAMETER by the chain beans so a slice test can build either chain from a bare
+     * {@code ServerHttpSecurity.http()} and still get the production wiring.
+     *
+     * @return the shared handler instance
+     */
+    @Bean
+    WikiStepUpAccessDeniedHandler wikiStepUpAccessDeniedHandler() {
+        return new WikiStepUpAccessDeniedHandler();
     }
 
     /**
@@ -284,14 +317,17 @@ public class SecurityConfig {
      * tests use). Every non-spec route is identical to prod.
      *
      * @param http the {@link ServerHttpSecurity} to configure
+     * @param stepUpAccessDenied the step-up-aware access-denied handler
      * @return the built {@link SecurityWebFilterChain} for the dev/test profile
      */
     @Bean
     @Profile({"dev", "test"})
-    SecurityWebFilterChain devFilterChain(ServerHttpSecurity http) {
+    SecurityWebFilterChain devFilterChain(ServerHttpSecurity http,
+                                          WikiStepUpAccessDeniedHandler stepUpAccessDenied) {
         return http
                 .csrf(ServerHttpSecurity.CsrfSpec::disable)
                 .headers(SecurityConfig::hardenHeaders)
+                .exceptionHandling(e -> e.accessDeniedHandler(stepUpAccessDenied))
                 .authorizeExchange(ex -> {
                     commonRoutes(ex);
                     ex.pathMatchers(SPEC_PATHS).permitAll();
@@ -309,14 +345,17 @@ public class SecurityConfig {
      * non-spec route is identical to dev/test.
      *
      * @param http the {@link ServerHttpSecurity} to configure
+     * @param stepUpAccessDenied the step-up-aware access-denied handler
      * @return the built {@link SecurityWebFilterChain} for the production profile
      */
     @Bean
     @Profile("!dev & !test")
-    SecurityWebFilterChain filterChain(ServerHttpSecurity http) {
+    SecurityWebFilterChain filterChain(ServerHttpSecurity http,
+                                       WikiStepUpAccessDeniedHandler stepUpAccessDenied) {
         return http
                 .csrf(ServerHttpSecurity.CsrfSpec::disable)
                 .headers(SecurityConfig::hardenHeaders)
+                .exceptionHandling(e -> e.accessDeniedHandler(stepUpAccessDenied))
                 .authorizeExchange(ex -> {
                     commonRoutes(ex);
                     ex.pathMatchers(SPEC_PATHS).hasAnyRole("ADMIN", "SUPERADMIN");

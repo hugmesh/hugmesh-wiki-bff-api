@@ -79,7 +79,7 @@ class SecurityHeadersSliceTest {
                 TenancyResolvers.tenantResolver(tenancy);
 
         SecurityConfig config = new SecurityConfig(registry, provider(resolver));
-        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http());
+        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http(), config.wikiStepUpAccessDeniedHandler());
         client = WebTestClient.bindToController(new ProbeController())
                 .webFilter(new WebFilterChainProxy(chain))
                 .build();
