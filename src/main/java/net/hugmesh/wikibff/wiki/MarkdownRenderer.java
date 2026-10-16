@@ -4,6 +4,7 @@ import org.commonmark.Extension;
 import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.node.Node;
 import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.DefaultUrlSanitizer;
 import org.commonmark.renderer.html.HtmlRenderer;
 import org.springframework.stereotype.Component;
 
@@ -16,10 +17,24 @@ import java.util.List;
  * ZIM (re)build (PR4) serve, so rendering happens ONCE per write and the read path
  * (kiwix-serve) carries no render step.
  *
- * <p><b>Safe by default.</b> The CommonMark {@link HtmlRenderer} is left with raw-HTML
- * ESCAPING ON ({@code escapeHtml(true)} / no {@code sanitizeUrls(false)}), so any raw
- * {@code <script>}/inline HTML an author embeds is escaped rather than emitted live —
- * the stored HTML is XSS-free for the read path / ZIM without an extra sanitizer pass.
+ * <p><b>Raw HTML and URLs are neutralised at render time.</b> Two separate holes are
+ * closed, and neither is closed by the other:
+ * <ul>
+ *   <li>Raw HTML: the CommonMark {@link HtmlRenderer} runs with {@code escapeHtml(true)},
+ *       so any {@code <script>}/inline HTML an author embeds is escaped rather than
+ *       emitted live.</li>
+ *   <li>Link and image destinations: {@code escapeHtml} does not touch them, so
+ *       {@code [x](javascript:alert(1))} would otherwise become a live
+ *       {@code <a href="javascript:...">}. The renderer therefore runs with
+ *       {@code sanitizeUrls(true)} and an explicit {@link DefaultUrlSanitizer} that
+ *       allows only the {@code http}, {@code https} and {@code mailto} schemes; any
+ *       other scheme ({@code javascript:}, {@code vbscript:}, {@code data:},
+ *       {@code file:}) has its destination dropped to an empty string. Scheme-less
+ *       (relative / fragment) destinations are kept.</li>
+ * </ul>
+ * With both in place the stored {@code content_html} carries no script-bearing markup or
+ * URL for the schemes covered by {@code MarkdownRendererTest}; consumers should still
+ * treat it as untrusted-by-default and keep their own sanitiser as defence in depth.
  * GitHub-flavoured tables are enabled (the seeded platform docs use them).
  */
 @Component
@@ -33,19 +48,27 @@ public class MarkdownRenderer {
      * (GFM) tables enabled and HTML escaping turned on. The GFM {@link TablesExtension}
      * is registered on both the parser and the renderer so pipe-table syntax in source
      * markdown is emitted as {@code <table>} elements. Raw inline HTML in the source is
-     * escaped ({@code escapeHtml(true)}) rather than passed through, so the produced
-     * {@code content_html} is safe to serve without an additional sanitiser pass.
+     * escaped ({@code escapeHtml(true)}) rather than passed through, and link/image
+     * destinations are restricted to {@code http}/{@code https}/{@code mailto} (plus
+     * scheme-less relative references) via {@code sanitizeUrls(true)}.
      */
     public MarkdownRenderer() {
         List<Extension> extensions = List.of(TablesExtension.create());
         this.parser = Parser.builder().extensions(extensions).build();
-        // escapeHtml(true): raw inline HTML in the source is ESCAPED, not emitted — the
-        // stored content_html is safe to serve directly (no <script> passthrough).
-        this.renderer = HtmlRenderer.builder().extensions(extensions).escapeHtml(true).build();
+        // escapeHtml(true): raw inline HTML in the source is ESCAPED, not emitted (no
+        // <script> passthrough). sanitizeUrls(true) + an EXPLICIT allow-list: escapeHtml
+        // does not cover link/image destinations, and the allow-list is spelled out here
+        // so a library default change cannot silently widen it.
+        this.renderer = HtmlRenderer.builder()
+                .extensions(extensions)
+                .escapeHtml(true)
+                .sanitizeUrls(true)
+                .urlSanitizer(new DefaultUrlSanitizer(List.of("http", "https", "mailto")))
+                .build();
     }
 
     /**
-     * Render markdown to safe HTML. A null/blank source renders to the empty string.
+     * Render markdown to HTML with raw HTML escaped and link/image schemes restricted. A null/blank source renders to the empty string.
      *
      * @param markdown the CommonMark (GFM) markdown source to render; may be
      *                 {@code null} or empty

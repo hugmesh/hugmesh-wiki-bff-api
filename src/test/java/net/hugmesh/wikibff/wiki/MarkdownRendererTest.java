@@ -2,6 +2,10 @@ package net.hugmesh.wikibff.wiki;
 
 import org.junit.jupiter.api.Test;
 
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -36,6 +40,75 @@ class MarkdownRendererTest {
         // The raw <script> is ESCAPED (&lt;script&gt;), never emitted as a live tag.
         assertThat(html).doesNotContain("<script>");
         assertThat(html).contains("&lt;script&gt;");
+    }
+
+    /** Link destinations in every spelling that must never reach an href/src attribute. */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "[x](javascript:alert(1))",
+            "[x](JaVaScRiPt:alert(1))",
+            "[x](vbscript:msgbox(1))",
+            "[x](data:text/html;base64,AAA)",
+            "[x](&#106;avascript:alert(1))",
+            "[x](&#x6A;avascript:alert(1))",
+            "[x](<javascript:alert(1)>)",
+            "[x](file:///etc/passwd)",
+            "[x][r]\n\n[r]: javascript:alert(1)",
+            "<javascript:alert(1)>",
+            "[x](javascript:alert(1) \"title\")",
+    })
+    void dangerousLinkSchemesNeverReachHref(String markdown) {
+        String html = renderer.toHtml(markdown);
+        assertThat(html.toLowerCase()).doesNotContain("href=\"javascript:")
+                .doesNotContain("href=\"vbscript:")
+                .doesNotContain("href=\"data:")
+                .doesNotContain("href=\"file:");
+        assertThat(html).doesNotContainPattern("(?i)href=\"\\s*(java|vb)");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "![i](javascript:alert(1))",
+            "![i](data:text/html;base64,AAA)",
+            "![i](data:image/svg+xml;base64,AAA)",
+            "![i](vbscript:msgbox(1))",
+            "![i](JAVASCRIPT:alert(1))",
+            "![i](&#106;avascript:alert(1))",
+            "![i][r]\n\n[r]: data:text/html;base64,AAA",
+    })
+    void dangerousImageSchemesNeverReachSrc(String markdown) {
+        String html = renderer.toHtml(markdown);
+        assertThat(html.toLowerCase()).doesNotContain("src=\"javascript:")
+                .doesNotContain("src=\"vbscript:")
+                .doesNotContain("src=\"data:");
+        assertThat(html).doesNotContainPattern("(?i)src=\"\\s*(java|vb)");
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "[x](https://example.org/a?b=1) | https://example.org/a?b=1",
+            "[x](http://example.org/a)      | http://example.org/a",
+            "[x](mailto:a@example.org)      | mailto:a@example.org",
+            "[x](/wiki/page)                | /wiki/page",
+            "[x](#anchor)                   | #anchor",
+            "[x](../other)                  | ../other",
+    })
+    void ordinaryLinksSurvive(String markdown, String href) {
+        assertThat(renderer.toHtml(markdown)).contains("href=\"" + href + "\"").contains(">x</a>");
+    }
+
+    @Test
+    void ordinaryImageSurvives() {
+        assertThat(renderer.toHtml("![i](https://example.org/a.png)"))
+                .contains("<img src=\"https://example.org/a.png\"");
+    }
+
+    @Test
+    void reportedExploitInputRendersWithEmptyDestinations() {
+        String html = renderer.toHtml(
+                "[x](javascript:alert(1)) ![i](data:text/html;base64,AAA)");
+        assertThat(html).isEqualTo(
+                "<p><a rel=\"nofollow\" href=\"\">x</a> <img src=\"\" alt=\"i\" /></p>\n");
     }
 
     @Test
