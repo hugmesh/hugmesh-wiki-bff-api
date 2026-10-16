@@ -37,8 +37,8 @@ The `PrincipalDomain` scope resolver stays local.
   `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
   and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
   `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The suite
-  holds **400** `@Test` methods (counted from source on 2026-10-07, not run for this
-  edit). It runs against a real Postgres via Testcontainers, not an in-memory substitute.
+  holds **428** `@Test` methods (counted from source on 2026-10-15). It runs against a
+  real Postgres via Testcontainers, not an in-memory substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
   server**. The browser holds only an **opaque `bff_`-prefixed session**, issued and
   refreshed by `user-bff`, which performs the Casdoor OIDC code→token exchange. The user
@@ -684,6 +684,30 @@ the un-armed, armed, rollback, tag-timing, forward-collision and SUPERADMIN-cost
   without a token) but require **ROLE_ADMIN|SUPERADMIN in prod** (the `!dev & !test` filter
   chain). The API contract is never publicly reachable in a production deployment.
 
+- **MFA step-up on the privileged paths, and how a refusal is signalled.**
+  `/bff/wiki/superadmin/**` and `/bff/wiki/admin/**` are wrapped in
+  `SecurityConfig.stepUp`: while `app.mfa.enabled=false` (the default) that wrapper is a
+  no-op; when the flag is on they additionally demand the `MFA_SATISFIED` authority that
+  `CasdoorAuthorities` derives only from a fresh `mfa_satisfied_at` claim. A step-up refusal
+  used to be a bare `403`, byte-identical to a role refusal, so a UI could not know whether an
+  MFA challenge could help (hugmesh-wiki-bff-api#35). It is now rendered by
+  `WikiStepUpAccessDeniedHandler` **only** when the role rule granted and the `MFA_SATISFIED`
+  leg denied:
+
+  | | |
+  | --- | --- |
+  | **Status** | `403`, unchanged |
+  | **Header** | `X-Step-Up-Required: X-Wiki-StepUp` (the platform `X-<flavour>-StepUp` shape; a flavour name, not a request header this service reads) |
+  | **Body** | `{"error":"<verb> requires step-up re-authentication (present X-Wiki-StepUp)"}`, `<verb>` being `wiki management` (superadmin group) or `wiki administration` (admin group); `requires step-up` is the legacy phrase for clients without the header |
+
+  There is no signal on a role `403`, a `401`, a call that is granted, the ordinary
+  `/bff/wiki/**` read floor, or anything at all while the flag is off. Every non-step-up `403`
+  keeps Spring's own response (the RFC 6750 `WWW-Authenticate: Bearer error="insufficient_scope"`
+  challenge, empty body): the handler delegates to `BearerTokenServerAccessDeniedHandler`,
+  which is what Spring resolves for a chain with `oauth2ResourceServer`, and
+  `StepUpAccessDeniedWiringTest` compares the two responses at runtime.
+  `StepUpSignalSliceTest` drives all of the above through both profile chains.
+
 ## CI / security pipeline
 
 The test pipeline runs on **GitLab**. The GitHub repo is pull-mirrored into the platform's
@@ -918,7 +942,9 @@ repo.**
   platform's pen-test rollout, still in flight across the platform's service repos.
 - 🚧 **Platform security backlog / step-up**: this BFF's half of MFA step-up is built
   (`SecurityConfig.stepUp`, see [Role model](#role-model-platform-cascade-superadmin--admin--mod--user))
-  but ships dark: it does nothing until the platform sets `app.mfa.enabled=true`. The
+  but ships dark: it does nothing until the platform sets `app.mfa.enabled=true`. A
+  step-up refusal carries the `X-Step-Up-Required` signal (see
+  [Security posture](#security-posture)). The
   platform-wide parts (Casdoor `amr`/`acr` → `MFA_SATISFIED`, `gateway_route_access.mfa_required`,
   and moving UI bearer tokens out of `localStorage`) live in other repos and are not
   checked here.
@@ -942,8 +968,8 @@ boundaries of this repo, not unfinished code in it:
 - **PMD / Checkstyle / SpotBugs gate CI.** `hugmesh-parent` configures all three and binds
   them to the Maven **`verify`** phase, and the GitLab `test` job runs `./mvnw -B -s
   settings.xml verify`. The Docker build runs `./mvnw package -DskipTests`, which stops
-  before `verify`. Run on `origin/main` on 2026-10-07 with `./mvnw -o -B verify
-  -DskipTests`: PMD passed, Checkstyle reported 0 violations, SpotBugs reported 0 bugs.
+  before `verify`. Run on 2026-10-15 with `./mvnw -B -o -s settings.xml
+  verify`: PMD passed, Checkstyle reported 0 violations, SpotBugs reported 0 bugs.
   - The repo keeps one local SpotBugs exclusion, `spotbugs/exclude-filter.xml`, wired
     through `<excludeFilterFiles>` in `pom.xml`. It suppresses `EI_EXPOSE_REP2` for
     `WikiAccessGuard` only, and only for an injected collaborator: a `byte[]`, `char[]`,

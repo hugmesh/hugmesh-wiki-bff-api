@@ -83,7 +83,7 @@ class WikiProdSpecGateSliceTest {
         // Build the PROD chain (the spec gate is ADMIN|SUPERADMIN here) and install it as a
         // web filter so the resource-server auth + authorizeExchange run as in production.
         SecurityConfig config = new SecurityConfig(registry, provider(resolver));
-        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http());
+        SecurityWebFilterChain chain = config.filterChain(ServerHttpSecurity.http(), config.wikiStepUpAccessDeniedHandler());
         client = WebTestClient.bindToController(new ProbeController())
                 .webFilter(new WebFilterChainProxy(chain))
                 .build();
