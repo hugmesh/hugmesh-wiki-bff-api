@@ -70,8 +70,9 @@ jobs:
         run: bash scripts/test-release-version.sh
 
       # Shape checks on this file itself: no pull_request trigger, the RUNS_ON_PUBLISH runner
-      # line on every job, no literal :latest, and the preflight, BuildKit secret and
-      # refuse-to-overwrite gates still present. Needs PyYAML and fails (never skips) without it.
+      # line on version and github-release, the signed image job on hosted ubuntu-latest, no
+      # literal :latest, and the preflight, BuildKit secret, refuse-to-overwrite and signing
+      # gates still present. Needs PyYAML and fails (never skips) without it.
       - name: Test the release workflow shape
         run: python3 scripts/test-release-workflow.py
 
@@ -221,7 +222,7 @@ jobs:
           if len(repos) != 1:
               sys.exit(f"::error::expected one pushed repository, got {sorted(repos)}")
           if "latest" in tags:
-              sys.exit("::error::a :latest tag was pushed; beta images must never be tagged latest")
+              sys.exit("::error::a tag named latest was pushed; beta images must never be tagged latest")
           repo = repos.pop()
           if repo != repo.lower() or not repo.startswith("ghcr.io/hugmesh/"):
               sys.exit(f"::error::unexpected image repository {repo!r}")
