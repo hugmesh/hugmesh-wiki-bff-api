@@ -14,7 +14,7 @@
   <parent>
     <groupId>net.hugmesh</groupId>
     <artifactId>hugmesh-parent</artifactId>
-    <version>2.8.0</version>
+    <version>2.9.0-beta.1</version>
     <relativePath/>
   </parent>
 
@@ -22,7 +22,7 @@
   <!-- NO -api suffix in the artifactId (mirrors forum-bff / user-bff / admin-bff):
        -api is only in the repo/service/image name. -->
   <artifactId>wiki-bff</artifactId>
-  <version>0.2.0</version>
+  <version>0.2.0-beta.1</version>
 
   <properties>
     <!-- java.version (25), encoding, the hugmesh-commons version, the AWS SDK BOM
@@ -53,11 +53,14 @@
 
     <!-- commons test-jar: PostgresTestSupport (Testcontainers Postgres base) for the
          full-context (@SpringBootTest) tests migrated off the in-mem H2 dual-connection
-         that breaks under Boot 4. -->
+         that breaks under Boot 4. Pinned explicitly to 2.2.0-beta.1, the same commons
+         coordinate hugmesh-parent 2.9.0-beta.1 manages as hugmesh-commons.version: the
+         parent's dependencyManagement does NOT manage the tests classifier, so this
+         <version> must stay explicit and move with the parent. -->
     <dependency>
       <groupId>net.hugmesh</groupId>
       <artifactId>hugmesh-commons</artifactId>
-      <version>2.1.0</version>
+      <version>2.2.0-beta.1</version>
       <classifier>tests</classifier>
       <scope>test</scope>
     </dependency>

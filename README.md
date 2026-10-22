@@ -34,9 +34,10 @@ The `PrincipalDomain` scope resolver stays local.
   deliberate state, not an unfinished one (decision 30, same date).
 - **Dependency baseline:** Spring Boot **4.0.7** / Spring Cloud **2025.1.2**, **Java 25
   LTS** (`eclipse-temurin:25`), on the shared Maven artifacts
-  `net.hugmesh:hugmesh-parent:2.8.0` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
-  and `net.hugmesh:hugmesh-commons:2.1.0` (shared security/tenancy,
-  `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The suite
+  `net.hugmesh:hugmesh-parent:2.9.0-beta.1` ([parent POM](https://github.com/hugmesh/hugmesh-parent))
+  and `net.hugmesh:hugmesh-commons:2.2.0-beta.1` (shared security/tenancy,
+  `net.hugmesh.commons.*`), with Testcontainers **2.0.5** in the test path. The service
+  itself is `wiki-bff` **0.2.0-beta.1** (see [Versions and publishing](#versions-and-publishing)). The suite
   holds **428** `@Test` methods (counted from source on 2026-10-15). It runs against a
   real Postgres via Testcontainers, not an in-memory substitute.
 - **Place in the platform auth model.** This BFF is a **pure Casdoor-JWT OAuth2 resource
@@ -59,8 +60,9 @@ The `PrincipalDomain` scope resolver stays local.
   in a method body.
 - **CI runs on GitLab.** The GitHub repo is pull-mirrored into the platform's in-cluster
   GitLab instance, which runs the pipeline in
-  [CI / security pipeline](#ci--security-pipeline). A manual GitHub Actions workflow
-  (`release.yml`) builds the image and pushes it to GHCR. The cluster manifests in
+  [CI / security pipeline](#ci--security-pipeline). A GitHub Actions workflow
+  (`release.yml`) builds the image and pushes it to GHCR from `main` and from `v*` tags
+  (see [Versions and publishing](#versions-and-publishing)). The cluster manifests in
   `hugmesh-generator` set `seLinuxOptions` on the pod, enable mTLS (`SSL_ENABLED=true`,
   `SSL_CLIENT_AUTH=need`) and give the database `scram-sha-256` auth.
 
@@ -716,13 +718,8 @@ in-cluster GitLab instance (`mirror_trigger_builds=true`, per the comment in
 default branch, merge requests and tags. The `build:image` job runs only for the default
 branch and tags.
 
-A manual-only `release.yml` GitHub Actions workflow (`workflow_dispatch`) builds the image
-and pushes it to GHCR. It runs on a GitHub-hosted `ubuntu-latest` runner and needs the
-**repository** secret `PACKAGES_READ_TOKEN` (a classic PAT with `read:packages`). Its
-preflight step fails by name when the secret is missing or cannot read the
-`hugmesh-build-config`, `hugmesh-parent` and `hugmesh-commons` packages. The image is
-tagged with the first 12 characters of the commit SHA, and `latest` moves only when the
-run is on `main`.
+The GitHub Actions workflow `release.yml` publishes the image to GHCR. What it pushes, and
+when, is described in [Versions and publishing](#versions-and-publishing).
 
 ```mermaid
 flowchart LR
@@ -768,6 +765,43 @@ flowchart LR
   `pentest-sca` always runs the scan and fails the build on a finding at or above
   `PENTEST_FAIL_CVSS` (default `9`). It runs with `-DautoUpdate=true`.
 
+### Versions and publishing
+
+The package is in beta: `pom.xml` is `0.2.0-beta.1` (base `0.2.0` means built and tested,
+not yet proven on a live mesh). Each new published beta of the same base raises the
+`-beta.N` number; a published version is never reused or overwritten. It builds against
+`hugmesh-parent 2.9.0-beta.1` and the `hugmesh-commons 2.2.0-beta.1` tests jar, which the
+library release chain (build-config, then parent, then commons) must publish first.
+
+`.github/workflows/release.yml` publishes `ghcr.io/hugmesh/hugmesh-wiki-bff-api`. Its first
+job runs the release tests, then `scripts/release-version.sh`, which reads the version from
+`pom.xml` and decides what may be pushed:
+
+| Trigger | Image tags | GitHub Release |
+|---|---|---|
+| push to `main`, or a manual run on `main` | `main`, `sha-<12>` | none |
+| push of tag `v<version>`, or a manual run on that tag | `<version>`, `beta` (for a `-beta.N`), `sha-<12>` | prerelease, not latest |
+| anything else | refused | none |
+
+The tag must equal `v` + the `pom.xml` version, a `-SNAPSHOT` is refused, and a version
+that already exists in GHCR is never overwritten. `latest` moves only for a final
+(non-prerelease) version, and none exists yet. There is no pull-request trigger. Each job
+runs on the runner list in the repository variable `RUNS_ON_PUBLISH` (for example the
+local self-hosted runner) only for `main` and `v*` tags; otherwise, or when that variable
+is unset, it runs on GitHub-hosted `ubuntu-latest`.
+
+Before building, the image job checks that the **repository** secret `PACKAGES_READ_TOKEN`
+(a classic PAT with `read:packages`) can read `hugmesh-build-config`, `hugmesh-parent` and
+`hugmesh-commons` on GitHub Packages; without it, that step fails by name. GitHub Packages
+needs a token even for a public package, so the secret stays after the repository goes
+public.
+
+To publish a beta: merge the version change, then push an annotated tag `v<version>` on
+that `main` commit (the tag push runs the release). Re-run path:
+`gh workflow run release.yml -R hugmesh/hugmesh-wiki-bff-api --ref v<version>`. Test the
+release scripts with `bash scripts/test-release-version.sh` and
+`python3 scripts/test-release-workflow.py` (needs PyYAML).
+
 ## Build / test
 
 ```sh
@@ -808,7 +842,7 @@ Tests follow the platform's standard categories:
 This service uses the platform's shared Maven artifacts instead of carrying its own copy of
 the security and tenancy code. There are two moves:
 
-1. **Parent POM →** `net.hugmesh:hugmesh-parent:2.8.0` (itself a child of
+1. **Parent POM →** `net.hugmesh:hugmesh-parent:2.9.0-beta.1` (itself a child of
    `spring-boot-starter-parent:4.0.7`, so the whole Spring Boot dependency/plugin
    management is inherited transitively). The parent consolidates the reactive-BFF
    `<dependencies>` (webflux/actuator/security/oauth2-resource-server/validation,
@@ -817,7 +851,7 @@ the security and tenancy code. There are two moves:
    its `tests` jar, for `PostgresTestSupport`) plus the **wiki-specific** dependencies
    `commonmark` + `commonmark-ext-gfm-tables` (pinned at `0.24.0`).
 
-2. **Shared security/tenancy/web →** `net.hugmesh:hugmesh-commons:2.1.0`.
+2. **Shared security/tenancy/web →** `net.hugmesh:hugmesh-commons:2.2.0-beta.1`.
    The local copies of `security.{Roles,CasdoorAuthorities,DomainRegistry,DomainScope}`,
    `config.TenancyResourceServerConfig`, and `web.ApiException` were deleted and replaced
    by the commons equivalents:
@@ -833,7 +867,7 @@ the security and tenancy code. There are two moves:
    and it stays here on purpose. `config.SecurityConfig` (route matchers, CSRF-off and
    header policy, MFA step-up) and `config.SecuritySliceSupport` for tests are also local.
 
-   > Scope note: `hugmesh-commons` 2.1.0 carries shared **security/tenancy/web** only. The
+   > Scope note: `hugmesh-commons` 2.2.0-beta.1 carries shared **security/tenancy/web** only. The
    > newer [`hugmesh-auth-core`](https://github.com/hugmesh/hugmesh-auth-core) library
    > (shared account/session/MFA/Casdoor-admin infra) is consumed only by `user-bff` and
    > `admin-bff`. This resource server does **not** depend on it and has no
