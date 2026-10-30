@@ -19,9 +19,18 @@ What it pins, and why:
   * The existing gates stay: the cross-repo package preflight, the BuildKit
     packages_read_token secret, and the refuse-to-overwrite check on release runs.
   * Only the github-release job gets contents: write, and only on a release run.
+  * The refuse-to-overwrite step is EXECUTED, not only read: its run block runs the way the
+    runner runs a step with no shell: key (bash -e), with docker stubbed on PATH. An absent
+    image continues, a published one is refused, and any other probe error fails closed. A
+    bare out=$(probe) under bash -e ends the step on the first absent image, so the old form
+    fails this check.
 """
+import os
 import pathlib
+import stat
+import subprocess
 import sys
+import tempfile
 
 try:
     import yaml
@@ -160,6 +169,83 @@ tv = first("bash scripts/test-release-version.sh")
 tw = first("python3 scripts/test-release-workflow.py")
 check("version job runs both release tests before the guard",
       None not in (g, tv, tw) and tv < g and tw < g)
+
+
+# --- execute the refuse-to-overwrite step ------------------------------------------------
+# A step with no shell: key, under no defaults.run.shell, runs as `bash -e {0}`. That is the
+# shell this harness reproduces, so pin that nothing changed it first.
+check("refuse step uses the runner default shell (no shell: key, no defaults.run.shell)",
+      "shell" not in refuse
+      and "shell" not in ((wf.get("defaults") or {}).get("run") or {})
+      and "shell" not in ((image.get("defaults") or {}).get("run") or {}))
+
+DOCKER_STUB = """#!/bin/sh
+printf '%s\\n' "$*" >> "$STUB_LOG"
+case "$STUB_MODE" in
+  absent)  echo "ERROR: $4: not found"; exit 1 ;;
+  unknown) echo "ERROR: MANIFEST_UNKNOWN: manifest unknown"; exit 1 ;;
+  present) echo "Name: $4"; echo "MediaType: application/vnd.oci.image.index.v1+json"; exit 0 ;;
+  denied)  echo "ERROR: failed to authorize: denied: denied"; exit 1 ;;
+esac
+echo "stub: unknown STUB_MODE" >&2; exit 99
+"""
+
+
+def run_refuse(run_block, mode):
+    """Run the step's run block as `bash --noprofile --norc -e {0}` with docker stubbed."""
+    with tempfile.TemporaryDirectory(prefix="refuse-step-") as tmp:
+        tmp = pathlib.Path(tmp)
+        stub = tmp / "docker"
+        stub.write_text(DOCKER_STUB, encoding="utf-8")
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+        script = tmp / "step.sh"
+        script.write_text(run_block, encoding="utf-8")
+        log = tmp / "docker.log"
+        env = {"PATH": f"{tmp}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+               "IMAGE": "ghcr.io/hugmesh/hugmesh-wiki-bff-api", "VERSION": "9.9.9-beta.1",
+               "STUB_MODE": mode, "STUB_LOG": str(log)}
+        p = subprocess.run(["bash", "--noprofile", "--norc", "-e", str(script)], env=env,
+                           capture_output=True, text=True, timeout=30)
+        called = log.read_text(encoding="utf-8") if log.exists() else ""
+        return p.returncode, p.stdout + p.stderr, called
+
+
+REF = "ghcr.io/hugmesh/hugmesh-wiki-bff-api:9.9.9-beta.1"
+
+
+def refuse_behaves(run_block, label):
+    ok = True
+    for mode in ("absent", "unknown"):
+        rc, out, called = run_refuse(run_block, mode)
+        good = (rc == 0 and "is not published yet; continuing." in out and REF in out
+                and f"buildx imagetools inspect {REF}" in called)
+        check(f"{label}: image absent ({mode}) under bash -e -> continues (exit {rc})", good)
+        ok &= good
+    rc, out, called = run_refuse(run_block, "present")
+    good = rc == 1 and "already exists in GHCR" in out and REF in called
+    check(f"{label}: image present under bash -e -> refuses (exit {rc})", good)
+    ok &= good
+    rc, out, called = run_refuse(run_block, "denied")
+    good = rc == 1 and "could not tell whether" in out and "denied" in out and REF in called
+    check(f"{label}: other probe error under bash -e -> fails closed (exit {rc})", good)
+    ok &= good
+    return ok
+
+
+refuse_run = refuse.get("run", "")
+refuse_behaves(refuse_run, "refuse step")
+
+# The harness must be able to see the defect: the old bare-assignment form, run the same way,
+# has to die on an absent image. If it does not, this harness is not reproducing bash -e.
+OLD_FORM = 'out=$(docker buildx imagetools inspect "${ref}" 2>&1)\nrc=$?\n'
+old_run = ('set -uo pipefail\nref="${IMAGE}:${VERSION}"\n' + OLD_FORM
+           + 'if [ "${rc}" -eq 0 ]; then echo "already exists in GHCR"; exit 1; fi\n'
+           + 'echo "  ${ref} is not published yet; continuing."\n')
+rc, out, _ = run_refuse(old_run, "absent")
+check(f"harness reproduces the defect: old bare out=$(probe) form dies on an absent image (exit {rc})",
+      rc != 0 and "continuing" not in out)
+check("refuse step does not use the bare out=$(probe) / rc=$? form",
+      "\n".join(l.strip() for l in refuse_run.splitlines()).count(OLD_FORM) == 0)
 
 if failures:
     print(f"\ntest-release-workflow: {failures} failure(s)", file=sys.stderr)

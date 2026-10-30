@@ -156,8 +156,11 @@ jobs:
         run: |
           set -uo pipefail
           ref="${IMAGE}:${VERSION}"
-          out=$(docker buildx imagetools inspect "${ref}" 2>&1)
-          rc=$?
+          # The step runs under the runner's default 'bash -e {0}' and set -uo pipefail does not
+          # turn -e off: a bare out=$(...) would end the step with exit 1 the moment the probe
+          # fails, which is the normal first-publish answer. Capture the status instead.
+          rc=0
+          out=$(docker buildx imagetools inspect "${ref}" 2>&1) || rc=$?
           if [ "${rc}" -eq 0 ]; then
             echo "::error::${ref} already exists in GHCR. A published version is never overwritten: raise the -beta.N in pom.xml, merge, and tag the new version."
             exit 1
