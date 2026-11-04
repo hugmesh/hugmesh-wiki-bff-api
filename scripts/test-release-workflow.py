@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
-"""Shape checks for .github/workflows/release.yml. Pure text, no network.
+"""Tests for .github/workflows/release.yml. No network.
 
 Run: python3 scripts/test-release-workflow.py   (needs PyYAML; fails, never skips, without it)
 
-What it pins, and why:
+Behaviour: runs the workflow's own steps, extracted from the file: the signref check and the
+Release flags against each channel, and the overwrite guard, the floating-tag re-check, the
+digest check and the GitHub Release under bash -e, the way GitHub runs them, with docker and gh
+stubbed and a throwaway git origin.
+
+Shape (PyYAML), and why:
   * No pull_request / pull_request_target trigger. This workflow holds packages:write and may
     run on the self-hosted runner; a PR must never reach it.
-  * Triggers are exactly: push to main, push of v* tags, workflow_dispatch.
+  * Triggers are exactly: push to main and release/**, push of v* tags, workflow_dispatch.
   * version and github-release use the one runs-on line that picks vars.RUNS_ON_PUBLISH only
-    for a non-PR event on main or a v* / studio-v* tag, and ubuntu-latest otherwise.
+    for a non-PR event on main or a v* / studio-v* tag, and ubuntu-latest otherwise (so a
+    release/X.Y push runs hosted).
   * The image job (build, push, sign) runs on the GitHub-hosted ubuntu-latest, written
     literally: a published image is never built on a self-hosted runner. It signs the pushed
     DIGEST with cosign keyless and pushes provenance and SBOM attestations, and only it holds
     id-token: write and attestations: write.
   * notify-site is the only other job: hosted, no permissions, v* tags only, after the Release.
   * Image tags come only from the version guard (scripts/release-version.sh); no literal
-    :latest anywhere in the workflow.
+    :latest anywhere in the workflow code (comments aside).
   * The existing gates stay: the cross-repo package preflight, the BuildKit
     packages_read_token secret, and the refuse-to-overwrite check on release runs.
   * Only the github-release job gets contents: write, and only on a release run.
-  * The refuse-to-overwrite step is EXECUTED, not only read: its run block runs the way the
-    runner runs a step with no shell: key (bash -e), with docker stubbed on PATH. An absent
-    image continues, a published one is refused, and any other probe error fails closed. A
-    bare out=$(probe) under bash -e ends the step on the first absent image, so the old form
-    fails this check.
+  * The harness reproduces bash -e: the old bare out=$(probe) form of the overwrite guard dies
+    on an absent image when run the same way, and the workflow does not use it.
 """
+import hashlib
+import json
 import os
-import pathlib
-import stat
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 
 try:
     import yaml
@@ -38,216 +43,631 @@ except ImportError:  # fail closed: a missing parser must not look like a pass
     print("FAIL PyYAML is not installed; cannot check release.yml", file=sys.stderr)
     sys.exit(1)
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-WF_PATH = ROOT / ".github" / "workflows" / "release.yml"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WF = open(os.path.join(ROOT, ".github", "workflows", "release.yml"), encoding="utf-8").read()
+IMG = "ghcr.io/hugmesh/hugmesh-wiki-bff-api"
+# The stub registry holds raw manifest bytes; a digest is their sha256, as in a real registry.
+RAW = '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+RAW_OTHER = RAW.replace("[]", '[{"other":1}]')
+DIGEST = "sha256:" + hashlib.sha256(RAW.encode()).hexdigest()
+FAILURES = 0
+
+
+def check(desc, ok, detail=""):
+    global FAILURES
+    if ok:
+        print(f"ok   {desc}")
+    else:
+        FAILURES += 1
+        print(f"FAIL {desc}\n---- {detail}\n----", file=sys.stderr)
+
+
+def step_block(step_id_or_name):
+    """The text of one step, from its '- name:' line to the next '- name:' or job."""
+    lines = WF.splitlines()
+    for i, line in enumerate(lines):
+        if step_id_or_name in line:
+            start = i
+            while not lines[start].lstrip().startswith("- name:"):
+                start -= 1
+            end = i + 1
+            while end < len(lines) and not lines[end].lstrip().startswith("- name:") \
+                    and not re.match(r"^  [a-z-]+:\s*$", lines[end]):
+                end += 1
+            return "\n".join(lines[start:end])
+    raise SystemExit(f"step {step_id_or_name!r} not found in release.yml")
+
+
+# ── the signref python, exactly as the workflow runs it ───────────────────────────────
+signref = step_block("id: signref")
+m = re.search(r"python3 - <<'PY'\n(.*?)\n\s*PY\n", signref + "\n", re.S)
+SIGNREF_PY = textwrap.dedent(m.group(1)) if m else ""
+check("signref step holds a python heredoc", bool(SIGNREF_PY))
+check("signref keeps the literal `\"latest\" in tags`", '"latest" in tags' in SIGNREF_PY)
+for var in ("VERSION", "CHANNEL", "EXPECTED_TAGS"):
+    check(f"signref step env passes {var}", re.search(rf"^\s+{var}: \$\{{\{{ needs\.version\.outputs\.", signref, re.M) is not None)
+
+
+def run_signref(version, channel, guard_tags, pushed_tags=None):
+    pushed = guard_tags if pushed_tags is None else pushed_tags
+    with tempfile.NamedTemporaryFile("r", delete=False) as out:
+        path = out.name
+    env = dict(os.environ)
+    env.update({
+        "METADATA": json.dumps({"image.name": ",".join(f"{IMG}:{t}" for t in pushed)}),
+        "DIGEST": DIGEST,
+        "EXPECTED_TAGS": ",".join(f"{IMG}:{t}" for t in guard_tags),
+        "CHANNEL": channel,
+        "GITHUB_OUTPUT": path,
+    })
+    if version is None:
+        env.pop("VERSION", None)
+    else:
+        env["VERSION"] = version
+    r = subprocess.run([sys.executable, "-I", "-c", SIGNREF_PY], env=env, capture_output=True, text=True)
+    written = open(path).read()
+    os.unlink(path)
+    return r.returncode, r.stdout + r.stderr, written
+
+
+cases = [
+    # (description, version, channel, guard tags, pushed tags or None, should pass)
+    ("beta: :X.Y.Z-beta.N, :sha, :beta is signed", "0.3.0-beta.1", "beta",
+     ["0.3.0-beta.1", "sha-0123456789ab", "beta"], None, True),
+    ("stable newest line: :X.Y.Z, :sha, :X.Y, :latest is signed", "0.3.0", "stable",
+     ["0.3.0", "sha-0123456789ab", "0.3", "latest"], None, True),
+    ("stable older line: :X.Y.Z, :sha, :X.Y (no :latest) is signed", "0.2.4", "stable",
+     ["0.2.4", "sha-0123456789ab", "0.2"], None, True),
+    ("main build: :main, :sha is signed", "0.3.0-beta.1", "none",
+     ["main", "sha-0123456789ab"], None, True),
+    ("release branch build: :sha only is signed", "0.2.4", "none",
+     ["sha-0123456789ab"], None, True),
+    ("beta that pushed :latest is refused", "0.3.0-beta.1", "beta",
+     ["0.3.0-beta.1", "sha-0123456789ab", "beta", "latest"], None, False),
+    ("stable that pushed :beta is refused", "0.3.0", "stable",
+     ["0.3.0", "sha-0123456789ab", "0.3", "beta"], None, False),
+    ("beta that pushed a floating :X.Y is refused", "0.3.0-beta.1", "beta",
+     ["0.3.0-beta.1", "sha-0123456789ab", "beta", "0.3"], None, False),
+    ("release-branch build that pushed :latest is refused", "0.2.4", "none",
+     ["sha-0123456789ab", "latest"], None, False),
+    (":latest with VERSION missing is refused (fails closed)", None, "stable",
+     ["0.3.0", "sha-0123456789ab", "0.3", "latest"], None, False),
+    ("a pushed tag the guard did not choose is refused", "0.3.0", "stable",
+     ["0.3.0", "sha-0123456789ab", "0.3"], ["0.3.0", "sha-0123456789ab", "0.3", "latest"], False),
+    ("a guard tag that was not pushed is refused", "0.3.0", "stable",
+     ["0.3.0", "sha-0123456789ab", "0.3", "latest"], ["0.3.0", "sha-0123456789ab", "0.3"], False),
+]
+for desc, version, channel, guard_tags, pushed, should_pass in cases:
+    rc, out, written = run_signref(version, channel, guard_tags, pushed)
+    if should_pass:
+        check(f"signref: {desc}", rc == 0 and f"digest={DIGEST}" in written and f"repo={IMG}" in written, out)
+    else:
+        check(f"signref: {desc}", rc != 0 and "digest=" not in written, out)
+
+# ── the GitHub Release flags, exactly as the workflow computes them ───────────────────
+release = step_block("Create the GitHub Release")
+m = re.search(r"\n(\s*case \"\$\{CHANNEL\}:\$\{LATEST\}:\$\{VERSION\}\" in\n.*?\n\s*esac)\n", release, re.S)
+CASE = textwrap.dedent(m.group(1)) if m else ""
+check("github-release step decides flags from CHANNEL, LATEST and VERSION", bool(CASE))
+for var in ("CHANNEL", "LATEST"):
+    check(f"github-release step env passes {var}", re.search(rf"^\s+{var}: \$\{{\{{ needs\.version\.outputs\.", release, re.M) is not None)
+
+
+def flags(channel, latest, version):
+    script = "set -euo pipefail\nflags=()\n" + CASE + "\nprintf '%s\\n' \"${flags[@]}\"\n"
+    env = dict(os.environ, CHANNEL=channel, LATEST=latest, VERSION=version)
+    r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    return r.returncode, r.stdout.split()
+
+
+for desc, args, want in [
+    ("beta -> prerelease, not latest", ("beta", "false", "0.3.0-beta.1"), ["--prerelease", "--latest=false"]),
+    ("stable newest line -> full release marked Latest", ("stable", "true", "0.3.0"), ["--latest"]),
+    ("stable older line -> full release, not Latest", ("stable", "false", "0.2.4"), ["--latest=false"]),
+]:
+    rc, got = flags(*args)
+    check(f"release flags: {desc}", rc == 0 and got == want, f"rc={rc} got={got}")
+for desc, args in [
+    ("beta marked latest is refused", ("beta", "true", "0.3.0-beta.1")),
+    ("beta channel with a final version is refused", ("beta", "false", "0.3.0")),
+    ("stable channel with a prerelease version is refused", ("stable", "true", "0.3.0-beta.1")),
+    ("no channel is refused", ("none", "false", "0.3.0")),
+    ("empty channel is refused", ("", "", "0.3.0")),
+]:
+    rc, got = flags(*args)
+    check(f"release flags: {desc}", rc != 0, f"rc={rc} got={got}")
+
+# ── triggers, checkout depth, overwrite guard ─────────────────────────────────────────
+check("push runs on main and release/**", re.search(r"^\s+branches: \[main, 'release/\*\*'\]$", WF, re.M) is not None)
+check("tag pushes still run on v*", re.search(r"^\s+tags: \['v\*'\]$", WF, re.M) is not None)
+check("no pull_request trigger", re.search(r"^\s+pull_request(_target)?:", WF, re.M) is None)
+version_job = WF.split("\n  version:\n", 1)[1].split("\n  image:\n", 1)[0]
+check("version job checks out with fetch-depth: 0", re.search(r"^\s+fetch-depth: 0$", version_job, re.M) is not None)
+check("version job runs the guard tests and the guard",
+      "bash scripts/test-release-version.sh" in version_job and "bash scripts/release-version.sh" in version_job)
+for out in ("channel", "latest"):
+    check(f"version job exports {out}", f"{out}: ${{{{ steps.guard.outputs.{out} }}}}" in version_job)
+overwrite = step_block("Refuse to overwrite a published version")
+check("overwrite guard inspects only the immutable :<version>",
+      'ref="${IMAGE}:${VERSION}"' in overwrite and "docker buildx imagetools inspect" in overwrite
+      and not re.search(r":(latest|beta)\b", "\n".join(
+          l for l in overwrite.split("run: |", 1)[1].splitlines() if not l.lstrip().startswith("#"))))
+
+# ── the shell steps, run the way GitHub runs them ─────────────────────────────────────
+# A step with no shell: key runs as `bash -e {0}`, and `set -uo pipefail` does not turn -e off.
+check("release.yml sets no shell/defaults (these tests assume GitHub's bash -e {0})",
+      re.search(r"^\s*(defaults|shell):", WF, re.M) is None)
+
+
+def run_body(step_name):
+    """The run: block of the step called step_name, dedented."""
+    lines = step_block(f"- name: {step_name}").splitlines()
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"\s*run: \|", line):
+            indent = len(line) - len(line.lstrip())
+            body = []
+            for raw in lines[i + 1:]:
+                if raw.strip() and len(raw) - len(raw.lstrip()) <= indent:
+                    break
+                body.append(raw)
+            return textwrap.dedent("\n".join(body)) + "\n"
+    raise SystemExit(f"step {step_name!r} has no run: block")
+
+
+TMP = tempfile.TemporaryDirectory()
+WORK = TMP.name
+BIN = os.path.join(WORK, "bin")
+os.makedirs(BIN)
+LOG = os.path.join(WORK, "stub.log")
+
+
+def stub(name, script):
+    path = os.path.join(BIN, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    os.chmod(path, 0o755)
+
+
+def run_step(step_name, env, cwd=WORK):
+    """Runs the step under bash -e; returns (rc, combined output, lines the stubs logged)."""
+    path = os.path.join(WORK, "step.sh")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(run_body(step_name))
+    open(LOG, "w").close()
+    full = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "RELEASE_"))}
+    full.update({"PATH": BIN + os.pathsep + os.environ["PATH"], "IMAGE": IMG, "STUB_LOG": LOG})
+    full.update(env)
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-e", path], cwd=cwd, env=full, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr, open(LOG).read().splitlines()
+
+
+# Behaves like real buildx: `inspect REF` alone prints the listing; `inspect REF --raw` prints
+# the manifest's exact bytes, whose sha256 is the digest. STUB_REGISTRY maps ref to raw manifest
+# bytes, or to an error text. The overwrite guard and the digest check share it.
+stub("docker", r"""#!/usr/bin/env python3
+import hashlib, json, os, sys
+a = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write(" ".join(a) + "\n")
+if a[:3] != ["buildx", "imagetools", "inspect"] or len(a) not in (4, 5) or (len(a) == 5 and a[4] != "--raw"):
+    sys.exit(f"stub docker: unexpected args {a}")
+ref = a[3]
+got = json.loads(os.environ["STUB_REGISTRY"]).get(ref, "ERROR: " + ref + ": not found")
+if got.startswith("ERROR"):
+    print(got, file=sys.stderr)
+    sys.exit(1)
+if len(a) == 5:
+    sys.stdout.write(got)
+else:
+    digest = "sha256:" + hashlib.sha256(got.encode()).hexdigest()
+    print(f"Name:      {ref}\nMediaType: application/vnd.oci.image.index.v1+json\nDigest:    {digest}\n")
+""")
+
+
+# 1. "Refuse to overwrite a published version"
+def overwrite_step(channel, version, registry):
+    return run_step("Refuse to overwrite a published version",
+                    {"VERSION": version, "CHANNEL": channel, "STUB_REGISTRY": json.dumps(registry)})
+
+
+for channel, version in [("beta", "0.3.0-beta.1"), ("stable", "0.3.0")]:
+    ref = f"{IMG}:{version}"
+    for desc, answer in [("not found", None),
+                         ("MANIFEST_UNKNOWN", "ERROR: failed to authorize: MANIFEST_UNKNOWN: manifest unknown"),
+                         ("name unknown", "ERROR: name unknown")]:
+        rc, out, calls = overwrite_step(channel, version, {} if answer is None else {ref: answer})
+        check(f"overwrite step, {channel}: {desc} on a first publish continues under bash -e",
+              rc == 0 and "is not published yet; continuing" in out and calls == [f"buildx imagetools inspect {ref}"],
+              f"rc={rc} calls={calls} out={out}")
+    rc, out, _ = overwrite_step(channel, version, {ref: RAW})
+    want = "fix forward" if channel == "stable" else "raise the -beta.N"
+    check(f"overwrite step, {channel}: a published version is refused with the {channel} message",
+          rc != 0 and "already exists in GHCR" in out and want in out and "continuing" not in out, f"rc={rc} out={out}")
+    rc, out, _ = overwrite_step(channel, version, {ref: "ERROR: failed to authorize: denied: denied"})
+    check(f"overwrite step, {channel}: an unclassified registry answer fails closed",
+          rc != 0 and "could not tell whether" in out and "denied" in out and "continuing" not in out, f"rc={rc} out={out}")
+rc, out, calls = overwrite_step("stable", "0.3.0", {f"{IMG}:latest": RAW, f"{IMG}:0.3": RAW})
+check("overwrite step: floating :X.Y and :latest existing do not stop a stable",
+      rc == 0 and calls == [f"buildx imagetools inspect {IMG}:0.3.0"], f"rc={rc} calls={calls} out={out}")
+
+# 2. "Check every pushed tag resolves to the signed digest"
+OTHER = "sha256:" + hashlib.sha256(RAW_OTHER.encode()).hexdigest()
+PUSHED = [f"{IMG}:0.3.0", f"{IMG}:sha-0123456789ab", f"{IMG}:0.3", f"{IMG}:latest"]
+
+
+def digest_step(tags, registry):
+    return run_step("Check every pushed tag resolves to the signed digest",
+                    {"TAGS": ",".join(tags), "DIGEST": DIGEST, "STUB_REGISTRY": json.dumps(registry)})
+
+
+rc, out, calls = digest_step(PUSHED, {t: RAW for t in PUSHED})
+check("digest step: every tag on the signed digest passes, and each tag was asked with --raw",
+      rc == 0 and calls == [f"buildx imagetools inspect {t} --raw" for t in PUSHED], f"rc={rc} calls={calls} out={out}")
+rc, out, _ = digest_step(PUSHED, dict({t: RAW for t in PUSHED}, **{f"{IMG}:latest": RAW_OTHER}))
+check("digest step: a tag on another digest is refused and named",
+      rc != 0 and f"{IMG}:latest resolves to {OTHER}" in out, f"rc={rc} out={out}")
+rc, out, _ = digest_step(PUSHED, {t: RAW for t in PUSHED[:-1]})
+check("digest step: a pushed tag the registry cannot find is refused",
+      rc != 0 and "could not read" in out, f"rc={rc} out={out}")
+rc, out, calls = digest_step([], {})
+check("digest step: no tags at all is refused, not a vacuous pass", rc != 0 and not calls, f"rc={rc} calls={calls} out={out}")
+
+# ── a real origin and checkout, for the two steps that ask the version guard again ────
+#   M ── main (pom 0.4.0-beta.1)      R ── release/0.3 (pom 0.3.0)      O ── release/0.2 (pom 0.2.1)
+ORIGIN = os.path.join(WORK, "origin.git")
+DEV = os.path.join(WORK, "dev")
+POM = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <artifactId>wiki-bff</artifactId>
+  <version>%s</version>
+</project>
+"""
+
+
+def git(*args, cwd=None):
+    r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                        "-c", "tag.gpgSign=false", "-c", "init.defaultBranch=main", *args],
+                       cwd=cwd, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f"git {args}: {r.stdout}{r.stderr}")
+    return r.stdout.strip()
+
+
+def commit_pom(version):
+    with open(os.path.join(DEV, "pom.xml"), "w", encoding="utf-8") as f:
+        f.write(POM % version)
+    git("add", "-A", cwd=DEV)
+    git("commit", "-q", "-m", version, cwd=DEV)
+    return git("rev-parse", "HEAD", cwd=DEV)
+
+
+git("init", "-q", "--bare", ORIGIN)
+git("init", "-q", DEV)
+git("remote", "add", "origin", ORIGIN, cwd=DEV)
+os.makedirs(os.path.join(DEV, "scripts"))
+with open(os.path.join(ROOT, "scripts", "release-version.sh"), encoding="utf-8") as src, \
+        open(os.path.join(DEV, "scripts", "release-version.sh"), "w", encoding="utf-8") as dst:
+    dst.write(src.read())
+BASE = commit_pom("0.2.0-beta.1")
+M = commit_pom("0.4.0-beta.1")
+git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=DEV)
+git("checkout", "-q", "-b", "r03", BASE, cwd=DEV)
+R = commit_pom("0.3.0")
+git("push", "-q", "origin", "HEAD:refs/heads/release/0.3", cwd=DEV)
+git("checkout", "-q", "-b", "r02", BASE, cwd=DEV)
+O = commit_pom("0.2.1")
+git("push", "-q", "origin", "HEAD:refs/heads/release/0.2", cwd=DEV)
+TAG_COMMITS = {"v0.3.0": R, "v0.2.1": O, "v0.4.0-beta.1": M}
+for tag_name, sha in TAG_COMMITS.items():
+    git("tag", tag_name, sha, cwd=ORIGIN)
+CLONES = 0
+
+
+def checkout(sha):
+    """What actions/checkout with fetch-depth: 0 leaves: every branch and tag, HEAD on sha."""
+    global CLONES
+    CLONES += 1
+    ws = os.path.join(WORK, f"ws{CLONES}")
+    git("clone", "-q", ORIGIN, ws)
+    git("checkout", "-q", "--detach", sha, cwd=ws)
+    return ws
+
+
+def on_origin(*names, at=R):
+    for name in names:
+        git("tag", name, at, cwd=ORIGIN)
+
+
+def off_origin(*names):
+    for name in names:
+        git("tag", "-d", name, cwd=ORIGIN)
+
+
+def guard_env(tag_name):
+    return {"GITHUB_REF": f"refs/tags/{tag_name}", "GITHUB_SHA": TAG_COMMITS[tag_name]}
+
+
+def version_job(tag_name, ws):
+    """The version job's answer: the real guard's output, as the workflow passes it on."""
+    full = dict(os.environ, IMAGE=IMG, GITHUB_OUTPUT="", **guard_env(tag_name))
+    r = subprocess.run(["bash", "scripts/release-version.sh"], cwd=ws, env=full, capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f"fixture: the guard refused {tag_name}: {r.stderr}")
+    return dict(line.split("=", 1) for line in r.stdout.splitlines())
+
+
+# 3. "Re-check the floating tags against origin"
+RECHECK = "Re-check the floating tags against origin"
+
+
+def recheck(tag_name, ws, answer):
+    return run_step(RECHECK, dict(guard_env(tag_name), WANT_TAGS=answer["tags"], WANT_LATEST=answer["latest"]), cwd=ws)
+
+
+ws = checkout(R)
+answer = version_job("v0.3.0", ws)
+check("fixture: the version job says v0.3.0 moves :0.3 and :latest",
+      answer["latest"] == "true" and f"{IMG}:0.3," in answer["tags"] + ",", str(answer))
+rc, out, _ = recheck("v0.3.0", ws, answer)
+check("re-check: nothing changed on origin, the run continues", rc == 0 and "still correct" in out, f"rc={rc} out={out}")
+
+rc, out, _ = recheck("v0.3.0", ws, dict(answer, latest="false"))
+check("re-check: the right tags with a different latest answer stop the run", rc != 0 and "Re-run all jobs" in out, f"rc={rc} out={out}")
+rc, out, _ = recheck("v0.3.0", ws, dict(answer, tags=answer["tags"].replace(f",{IMG}:latest", "")))
+check("re-check: the same latest answer with different tags stops the run", rc != 0 and "Re-run all jobs" in out, f"rc={rc} out={out}")
+
+on_origin("v0.4.0")
+rc, out, _ = recheck("v0.3.0", ws, answer)
+check("re-check: a newer stable line tagged since the version job stops a stale :latest",
+      rc != 0 and "Re-run all jobs" in out and f"{IMG}:latest" in out and "still correct" not in out, f"rc={rc} out={out}")
+rc, out, _ = recheck("v0.3.0", ws, version_job("v0.3.0", ws))
+check("re-check: after 'Re-run all jobs' the same tag goes through without :latest",
+      rc == 0 and "latest=false" in out and f"{IMG}:latest" not in out, f"rc={rc} out={out}")
+off_origin("v0.4.0")
+git("fetch", "-q", "--force", "--prune", "origin", "+refs/tags/*:refs/tags/*", cwd=ws)
+
+on_origin("v0.3.1")
+rc, out, _ = recheck("v0.3.0", ws, answer)
+check("re-check: a higher patch tagged since the version job stops :X.Y moving backwards",
+      rc != 0 and "would move backwards" in out and "refuses it now" in out, f"rc={rc} out={out}")
+off_origin("v0.3.1")
+git("fetch", "-q", "--force", "--prune", "origin", "+refs/tags/*:refs/tags/*", cwd=ws)
+
+on_origin("v0.4.0")
+git("fetch", "-q", "--force", "origin", "+refs/tags/*:refs/tags/*", cwd=ws)
+stale_false = version_job("v0.3.0", ws)
+off_origin("v0.4.0")
+rc, out, _ = recheck("v0.3.0", ws, stale_false)
+check("re-check: a tag deleted from origin since the version job counts too (the fetch prunes)",
+      rc != 0 and "Re-run all jobs" in out and "latest=true" in out, f"rc={rc} out={out}")
+
+ws = checkout(O)
+answer = version_job("v0.2.1", ws)
+check("fixture: the version job says the older-line v0.2.1 does not move :latest", answer["latest"] == "false", str(answer))
+rc, out, _ = recheck("v0.2.1", ws, answer)
+check("re-check: an older-line patch still goes through, without :latest", rc == 0, f"rc={rc} out={out}")
+
+ws = checkout(M)
+answer = version_job("v0.4.0-beta.1", ws)
+on_origin("v0.5.0")
+rc, out, _ = recheck("v0.4.0-beta.1", ws, answer)
+check("re-check: a beta does not depend on the stable tags", rc == 0, f"rc={rc} out={out}")
+off_origin("v0.5.0")
+
+# 4. "Create the GitHub Release": gh stubbed, flags read back, the guard real.
+stub("gh", r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_LOG}"
+if [ "$1 $2" = "release view" ]; then
+  [ "${STUB_RELEASE_EXISTS:-}" = yes ]
+  exit $?
+fi
+[ "$1 $2" = "release create" ] && exit 0
+echo "stub gh: unexpected $*" >&2
+exit 97
+""")
+RELEASE_STEP = "Create the GitHub Release (beta prerelease never latest; stable latest only on the newest line)"
+
+
+def github_release(tag_name, channel, latest, *newer_tags, exists=""):
+    """The job's checkout happens now, so it holds newer_tags; the image job's answer was `latest`."""
+    on_origin(*newer_tags)
+    ws = checkout(TAG_COMMITS[tag_name])
+    off_origin(*newer_tags)
+    rc, out, calls = run_step(RELEASE_STEP, dict(
+        guard_env(tag_name), GH_TOKEN="x", VERSION=tag_name[1:], SHA12=TAG_COMMITS[tag_name][:12], CHANNEL=channel, LATEST=latest,
+        GITHUB_REF_NAME=tag_name, GITHUB_REPOSITORY="hugmesh/hugmesh-wiki-bff-api", STUB_RELEASE_EXISTS=exists), cwd=ws)
+    created = [c for c in calls if c.startswith("release create")]
+    return rc, out, created[0].split() if created else None
+
+
+rc, out, made = github_release("v0.3.0", "stable", "true")
+check("github-release: newest stable, nothing newer since: marked Latest",
+      rc == 0 and made and "--latest" in made and "--latest=false" not in made, f"rc={rc} made={made} out={out}")
+rc, out, made = github_release("v0.3.0", "stable", "true", "v0.4.0")
+check("github-release: a newer line tagged since the image job: created, not marked Latest",
+      rc == 0 and made and "--latest=false" in made and "--latest" not in made and "::warning::" in out, f"rc={rc} made={made} out={out}")
+rc, out, made = github_release("v0.3.0", "stable", "true", "v0.3.1")
+check("github-release: a higher patch tagged since (the guard refuses): created, not marked Latest, not a red run",
+      rc == 0 and made and "--latest=false" in made and "--latest" not in made and "would move backwards" in out, f"rc={rc} made={made} out={out}")
+rc, out, made = github_release("v0.2.1", "stable", "false")
+check("github-release: older-line patch: a full release, not marked Latest",
+      rc == 0 and made and "--latest=false" in made and "--prerelease" not in made, f"rc={rc} made={made} out={out}")
+off_origin("v0.3.0")  # the guard alone would now call v0.2.1 the newest line
+rc, out, made = github_release("v0.2.1", "stable", "false")
+on_origin("v0.3.0")
+check("github-release: the fresh answer never marks Latest a release whose image did not move :latest",
+      rc == 0 and made and "--latest=false" in made and "--latest" not in made, f"rc={rc} made={made} out={out}")
+rc, out, made = github_release("v0.4.0-beta.1", "beta", "false")
+check("github-release: beta: prerelease, not latest",
+      rc == 0 and made and "--prerelease" in made and "--latest=false" in made, f"rc={rc} made={made} out={out}")
+rc, out, made = github_release("v0.3.0", "stable", "true", exists="yes")
+check("github-release: an existing Release is left alone", rc == 0 and made is None and "not touching it" in out, f"rc={rc} made={made} out={out}")
+
+# 5. the wiring those steps depend on
+image_job = WF.split("\n  image:\n", 1)[1].split("\n  github-release:\n", 1)[0]
+release_job = WF.split("\n  github-release:\n", 1)[1].split("\n  notify-site:\n", 1)[0]
+check("image job checks out with fetch-depth: 0", re.search(r"uses: actions/checkout@v4\n\s+with:\n\s+fetch-depth: 0\n", image_job) is not None)
+check("github-release checks out with fetch-depth: 0, leaving no write token in the checkout",
+      re.search(r"uses: actions/checkout@v4\n\s+with:\n\s+fetch-depth: 0\n\s+persist-credentials: false\n", release_job) is not None)
+names = re.findall(r"^\s+- name: (.*)$", image_job, re.M)
+check("the re-check is the last step before the build",
+      names.index(RECHECK) + 1 == names.index("Build and push image"), str(names))
+recheck_block = step_block(f"- name: {RECHECK}")
+check("the re-check runs on every release run", "if: needs.version.outputs.kind == 'release'" in recheck_block)
+for var in ("WANT_TAGS", "WANT_LATEST"):
+    check(f"the re-check compares against the version job's {var}", re.search(rf"^\s+{var}: \$\{{\{{ needs\.version\.outputs\.", recheck_block, re.M) is not None)
+check("the image is pushed with the tags the re-check just confirmed", "tags: ${{ needs.version.outputs.tags }}" in step_block("- name: Build and push image"))
+digest_block = step_block("- name: Check every pushed tag resolves to the signed digest")
+check("the digest check runs whenever signref succeeded, against the signed digest",
+      "if: steps.signref.outcome == 'success'" in digest_block and "DIGEST: ${{ steps.signref.outputs.digest }}" in digest_block
+      and "TAGS: ${{ needs.version.outputs.tags }}" in digest_block)
+check("the digest check runs after the signature and both attestations",
+      names.index("Attest the SBOM (pushed to the registry)") < names.index("Check every pushed tag resolves to the signed digest"), str(names))
+
+# ── 6. shape, read with PyYAML ────────────────────────────────────────────────────────
+wf = yaml.safe_load(WF)
+# YAML 1.1 reads the bare key `on` as boolean True.
+on = wf.get("on", wf.get(True))
+jobs = wf.get("jobs", {})
 RUNS_ON = (
     "${{ fromJSON(github.event_name != 'pull_request' && github.event_name != 'pull_request_target'"
     " && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')"
     " || startsWith(github.ref, 'refs/tags/studio-v')) && vars.RUNS_ON_PUBLISH || '\"ubuntu-latest\"') }}"
 )
 
-failures = 0
-
-
-def check(desc, ok):
-    global failures
-    if ok:
-        print(f"ok   {desc}")
-    else:
-        print(f"FAIL {desc}", file=sys.stderr)
-        failures += 1
-
-
-text = WF_PATH.read_text(encoding="utf-8")
-wf = yaml.safe_load(text)
-# YAML 1.1 reads the bare key `on` as boolean True.
-on = wf.get("on", wf.get(True))
-jobs = wf.get("jobs", {})
-
-check("triggers are exactly push, workflow_dispatch",
+check("shape: triggers are exactly push, workflow_dispatch",
       isinstance(on, dict) and set(on) == {"push", "workflow_dispatch"})
-check("no pull_request or pull_request_target trigger anywhere",
+check("shape: no pull_request or pull_request_target trigger anywhere",
       isinstance(on, dict) and not ({"pull_request", "pull_request_target"} & set(on)))
 push = (on or {}).get("push") or {}
-check("push runs on branch main only", push.get("branches") == ["main"])
-check("push runs on v* tags only", push.get("tags") == ["v*"])
+check("shape: push runs on branches main and release/** only", push.get("branches") == ["main", "release/**"])
+check("shape: push runs on v* tags only", push.get("tags") == ["v*"])
+check("shape: the release-channels marker is present (scripts/release.sh --channel stable needs it)",
+      "hugmesh-release-channels: beta+stable" in WF)
 
-check("workflow default permissions are contents: read only",
+check("shape: workflow default permissions are contents: read only",
       wf.get("permissions") == {"contents": "read"})
-check("jobs are version, image, github-release, notify-site",
+check("shape: jobs are version, image, github-release, notify-site",
       set(jobs) == {"version", "image", "github-release", "notify-site"})
-for name in ("version", "github-release"):
-    check(f"job {name} uses the RUNS_ON_PUBLISH runner line", jobs.get(name, {}).get("runs-on") == RUNS_ON)
+for job_name in ("version", "github-release"):
+    check(f"shape: job {job_name} uses the RUNS_ON_PUBLISH runner line", jobs.get(job_name, {}).get("runs-on") == RUNS_ON)
 # The signed publish job never runs on the self-hosted runner: literal hosted label only.
-check("job image runs on the hosted ubuntu-latest runner, written literally",
+check("shape: job image runs on the hosted ubuntu-latest runner, written literally",
       jobs.get("image", {}).get("runs-on") == "ubuntu-latest")
 
 image = jobs.get("image", {})
-steps = image.get("steps", [])
-by_name = {s.get("name", ""): s for s in steps}
-check("image job has exactly contents: read, packages: write, id-token: write, attestations: write",
+img_steps = image.get("steps", [])
+img_by_name = {st.get("name", ""): st for st in img_steps}
+img_names = [st.get("name", "") for st in img_steps]
+img_ids = {st.get("id"): i for i, st in enumerate(img_steps) if st.get("id")}
+check("shape: image job has exactly contents: read, packages: write, id-token: write, attestations: write",
       image.get("permissions") == {"contents": "read", "packages": "write",
                                    "id-token": "write", "attestations": "write"})
-check("only the image job gets id-token or attestations",
+check("shape: only the image job gets id-token or attestations",
       all(not ({"id-token", "attestations"} & set(j.get("permissions") or {}))
           for n, j in jobs.items() if n != "image")
       and not ({"id-token", "attestations"} & set(wf.get("permissions") or {})))
-names = [s.get("name", "") for s in steps]
-ids = {s.get("id"): i for i, s in enumerate(steps) if s.get("id")}
-signref = steps[ids["signref"]] if "signref" in ids else {}
-check("signing resolves the digest from the build step and refuses latest and non-sha256",
-      "build" in ids and "signref" in ids and ids["build"] < ids["signref"]
-      and signref.get("if") == "steps.build.outcome == 'success'"
-      and "steps.build.outputs.digest" in str(signref.get("env", {}))
-      and 'sha256:[0-9a-f]{64}' in signref.get("run", "")
-      and '"latest" in tags' in signref.get("run", ""))
+sr = img_steps[img_ids["signref"]] if "signref" in img_ids else {}
+check("shape: signing resolves the digest from the build step and refuses latest and non-sha256",
+      "build" in img_ids and "signref" in img_ids and img_ids["build"] < img_ids["signref"]
+      and sr.get("if") == "steps.build.outcome == 'success'"
+      and "steps.build.outputs.digest" in str(sr.get("env", {}))
+      and 'sha256:[0-9a-f]{64}' in sr.get("run", "")
+      and '"latest" in tags' in sr.get("run", ""))
 
 
-def after_signref(name):
-    i = names.index(name) if name in names else -1
-    return i > ids.get("signref", 10**6) and steps[i].get("if") == "steps.signref.outcome == 'success'"
+def after_signref(step_name):
+    i = img_names.index(step_name) if step_name in img_names else -1
+    return i > img_ids.get("signref", 10**6) and img_steps[i].get("if") == "steps.signref.outcome == 'success'"
 
 
-sign = by_name.get("Sign the image digest (cosign keyless, GitHub OIDC)", {})
-check("image is signed by digest with cosign keyless",
+sign = img_by_name.get("Sign the image digest (cosign keyless, GitHub OIDC)", {})
+check("shape: image is signed by digest with cosign keyless",
       after_signref("Sign the image digest (cosign keyless, GitHub OIDC)")
       and sign.get("run", "").strip() == 'cosign sign --yes "$REF"'
       and sign.get("env", {}).get("REF") == "${{ steps.signref.outputs.repo }}@${{ steps.signref.outputs.digest }}")
-for step, action in (("Attest build provenance (pushed to the registry)", "actions/attest-build-provenance@"),
-                     ("Attest the SBOM (pushed to the registry)", "actions/attest-sbom@")):
-    st = by_name.get(step, {})
+for step_name, action in (("Attest build provenance (pushed to the registry)", "actions/attest-build-provenance@"),
+                          ("Attest the SBOM (pushed to the registry)", "actions/attest-sbom@")):
+    st = img_by_name.get(step_name, {})
     w = st.get("with", {})
-    check(f"{step}: {action} on the pushed digest",
-          after_signref(step) and str(st.get("uses", "")).startswith(action)
+    check(f"shape: {step_name}: {action} on the pushed digest",
+          after_signref(step_name) and str(st.get("uses", "")).startswith(action)
           and w.get("subject-digest") == "${{ steps.signref.outputs.digest }}"
           and w.get("push-to-registry") is True)
 note = jobs.get("notify-site", {})
-check("notify-site is hosted, has no permissions, runs only for v* tags after the Release",
+check("shape: notify-site is hosted, has no permissions, runs only for v* tags after the Release",
       note.get("runs-on") == "ubuntu-latest" and note.get("permissions") == {}
       and note.get("if") == "startsWith(github.ref, 'refs/tags/v')"
       and note.get("needs") == ["github-release"])
-pre = by_name.get("Preflight, cross-repo package read", {})
-check("image job keeps the cross-repo package preflight",
+pre = img_by_name.get("Preflight, cross-repo package read", {})
+check("shape: image job keeps the cross-repo package preflight",
       "PACKAGES_READ_TOKEN" in str(pre.get("env", {})) and "maven.pkg.github.com" in pre.get("run", ""))
-refuse = by_name.get("Refuse to overwrite a published version", {})
-check("release runs refuse to overwrite a published version",
+refuse = img_by_name.get("Refuse to overwrite a published version", {})
+check("shape: release runs refuse to overwrite a published version",
       refuse.get("if") == "needs.version.outputs.kind == 'release'"
       and "imagetools inspect" in refuse.get("run", ""))
-build = by_name.get("Build and push image", {}).get("with", {})
-check("image tags come only from the version guard",
+build = img_by_name.get("Build and push image", {}).get("with", {})
+check("shape: image tags come only from the version guard",
       build.get("tags") == "${{ needs.version.outputs.tags }}")
-check("BuildKit packages_read_token secret is kept",
+check("shape: BuildKit packages_read_token secret is kept",
       "packages_read_token=${{ secrets.PACKAGES_READ_TOKEN }}" in str(build.get("secrets", "")))
-check("OCI source label links the package to this repo",
+check("shape: OCI source label links the package to this repo",
       "org.opencontainers.image.source=https://github.com/${{ github.repository }}" in str(build.get("labels", "")))
-code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-check("no literal :latest tag in the workflow (comments aside)", ":latest" not in code)
+code = "\n".join(line for line in WF.splitlines() if not line.lstrip().startswith("#"))
+check("shape: no literal :latest tag in the workflow (comments aside)", ":latest" not in code)
 
 rel = jobs.get("github-release", {})
-check("github-release runs only on a release run",
+check("shape: github-release runs only on a release run",
       rel.get("if") == "needs.version.outputs.kind == 'release'")
-check("only github-release gets contents: write", rel.get("permissions") == {"contents": "write"}
+check("shape: only github-release gets contents: write", rel.get("permissions") == {"contents": "write"}
       and all("write" not in str(j.get("permissions", {}).get("contents", ""))
               for n, j in jobs.items() if n != "github-release"))
-rel_run = "".join(s.get("run", "") for s in rel.get("steps", []))
-check("a beta release is prerelease and never latest",
+rel_run = "".join(st.get("run", "") for st in rel.get("steps", []))
+check("shape: a beta release is prerelease and never latest",
       "--prerelease --latest=false" in rel_run and "--verify-tag" in rel_run)
 
-guard = jobs.get("version", {})
-check("version job runs scripts/release-version.sh",
-      any("scripts/release-version.sh" in s.get("run", "") for s in guard.get("steps", [])))
-# This repository has no GitHub CI workflow, so the release workflow is where these tests run.
-runs = [s.get("run", "") for s in guard.get("steps", [])]
+vjob = jobs.get("version", {})
+vruns = [st.get("run", "") for st in vjob.get("steps", [])]
 
 
 def first(fragment):
-    return next((i for i, r in enumerate(runs) if fragment in r), None)
+    return next((i for i, r in enumerate(vruns) if fragment in r), None)
 
 
-g = first("bash scripts/release-version.sh")
-tv = first("bash scripts/test-release-version.sh")
-tw = first("python3 scripts/test-release-workflow.py")
-check("version job runs both release tests before the guard",
-      None not in (g, tv, tw) and tv < g and tw < g)
+g_i = first("bash scripts/release-version.sh")
+tv_i = first("bash scripts/test-release-version.sh")
+tw_i = first("python3 scripts/test-release-workflow.py")
+check("shape: version job runs both release tests before the guard",
+      None not in (g_i, tv_i, tw_i) and tv_i < g_i and tw_i < g_i)
+check("shape: version job checks out with fetch-depth: 0",
+      any((st.get("with") or {}).get("fetch-depth") == 0 for st in vjob.get("steps", [])
+          if str(st.get("uses", "")).startswith("actions/checkout@")))
 
-
-# --- execute the refuse-to-overwrite step ------------------------------------------------
 # A step with no shell: key, under no defaults.run.shell, runs as `bash -e {0}`. That is the
 # shell this harness reproduces, so pin that nothing changed it first.
-check("refuse step uses the runner default shell (no shell: key, no defaults.run.shell)",
+check("shape: refuse step uses the runner default shell (no shell: key, no defaults.run.shell)",
       "shell" not in refuse
       and "shell" not in ((wf.get("defaults") or {}).get("run") or {})
       and "shell" not in ((image.get("defaults") or {}).get("run") or {}))
 
-DOCKER_STUB = """#!/bin/sh
-printf '%s\\n' "$*" >> "$STUB_LOG"
-case "$STUB_MODE" in
-  absent)  echo "ERROR: $4: not found"; exit 1 ;;
-  unknown) echo "ERROR: MANIFEST_UNKNOWN: manifest unknown"; exit 1 ;;
-  present) echo "Name: $4"; echo "MediaType: application/vnd.oci.image.index.v1+json"; exit 0 ;;
-  denied)  echo "ERROR: failed to authorize: denied: denied"; exit 1 ;;
-esac
-echo "stub: unknown STUB_MODE" >&2; exit 99
-"""
-
-
-def run_refuse(run_block, mode):
-    """Run the step's run block as `bash --noprofile --norc -e {0}` with docker stubbed."""
-    with tempfile.TemporaryDirectory(prefix="refuse-step-") as tmp:
-        tmp = pathlib.Path(tmp)
-        stub = tmp / "docker"
-        stub.write_text(DOCKER_STUB, encoding="utf-8")
-        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-        script = tmp / "step.sh"
-        script.write_text(run_block, encoding="utf-8")
-        log = tmp / "docker.log"
-        env = {"PATH": f"{tmp}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-               "IMAGE": "ghcr.io/hugmesh/hugmesh-wiki-bff-api", "VERSION": "9.9.9-beta.1",
-               "STUB_MODE": mode, "STUB_LOG": str(log)}
-        p = subprocess.run(["bash", "--noprofile", "--norc", "-e", str(script)], env=env,
-                           capture_output=True, text=True, timeout=30)
-        called = log.read_text(encoding="utf-8") if log.exists() else ""
-        return p.returncode, p.stdout + p.stderr, called
-
-
-REF = "ghcr.io/hugmesh/hugmesh-wiki-bff-api:9.9.9-beta.1"
-
-
-def refuse_behaves(run_block, label):
-    ok = True
-    for mode in ("absent", "unknown"):
-        rc, out, called = run_refuse(run_block, mode)
-        good = (rc == 0 and "is not published yet; continuing." in out and REF in out
-                and f"buildx imagetools inspect {REF}" in called)
-        check(f"{label}: image absent ({mode}) under bash -e -> continues (exit {rc})", good)
-        ok &= good
-    rc, out, called = run_refuse(run_block, "present")
-    good = rc == 1 and "already exists in GHCR" in out and REF in called
-    check(f"{label}: image present under bash -e -> refuses (exit {rc})", good)
-    ok &= good
-    rc, out, called = run_refuse(run_block, "denied")
-    good = rc == 1 and "could not tell whether" in out and "denied" in out and REF in called
-    check(f"{label}: other probe error under bash -e -> fails closed (exit {rc})", good)
-    ok &= good
-    return ok
-
-
-refuse_run = refuse.get("run", "")
-refuse_behaves(refuse_run, "refuse step")
-
-# The harness must be able to see the defect: the old bare-assignment form, run the same way,
-# has to die on an absent image. If it does not, this harness is not reproducing bash -e.
+# The harness must be able to see the bash -e defect: the old bare-assignment form, run the same
+# way, has to die on an absent image. If it does not, this harness is not reproducing bash -e.
 OLD_FORM = 'out=$(docker buildx imagetools inspect "${ref}" 2>&1)\nrc=$?\n'
-old_run = ('set -uo pipefail\nref="${IMAGE}:${VERSION}"\n' + OLD_FORM
-           + 'if [ "${rc}" -eq 0 ]; then echo "already exists in GHCR"; exit 1; fi\n'
-           + 'echo "  ${ref} is not published yet; continuing."\n')
-rc, out, _ = run_refuse(old_run, "absent")
-check(f"harness reproduces the defect: old bare out=$(probe) form dies on an absent image (exit {rc})",
-      rc != 0 and "continuing" not in out)
+old_path = os.path.join(WORK, "old-form.sh")
+with open(old_path, "w", encoding="utf-8") as f:
+    f.write('set -uo pipefail\nref="${IMAGE}:${VERSION}"\n' + OLD_FORM
+            + 'if [ "${rc}" -eq 0 ]; then echo "already exists in GHCR"; exit 1; fi\n'
+            + 'echo "  ${ref} is not published yet; continuing."\n')
+old_env = dict(os.environ, PATH=BIN + os.pathsep + os.environ["PATH"], IMAGE=IMG, VERSION="9.9.9-beta.1",
+               STUB_LOG=LOG, STUB_REGISTRY="{}")
+r = subprocess.run(["bash", "--noprofile", "--norc", "-e", old_path], env=old_env, capture_output=True, text=True)
+check(f"harness reproduces the defect: old bare out=$(probe) form dies on an absent image (exit {r.returncode})",
+      r.returncode != 0 and "continuing" not in r.stdout + r.stderr, r.stdout + r.stderr)
 check("refuse step does not use the bare out=$(probe) / rc=$? form",
-      "\n".join(l.strip() for l in refuse_run.splitlines()).count(OLD_FORM) == 0)
+      "\n".join(l.strip() for l in refuse.get("run", "").splitlines()).count(OLD_FORM) == 0)
 
-if failures:
-    print(f"\ntest-release-workflow: {failures} failure(s)", file=sys.stderr)
+if FAILURES:
+    print(f"\ntest-release-workflow: {FAILURES} failure(s)", file=sys.stderr)
     sys.exit(1)
 print("\ntest-release-workflow: all checks passed")
