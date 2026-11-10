@@ -17,16 +17,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * The post-processor's contract with the Environment, tested directly rather than through
- * a booted context — because a {@code @SpringBootTest} CANNOT see the difference.
+ * a booted context — because no {@code @SpringBootTest} in this repo can see the difference.
  *
- * <p>That is a measured statement, not a preference. {@code @TestPropertySource} attaches
- * its inlined properties with {@code addFirst} AFTER environment post-processors have run,
- * so inlined properties outrank anything this class contributes no matter which end of the
- * list it is added to. A mutation flipping {@code addLast} to {@code addFirst} therefore
- * SURVIVES every boot test in this repo — it was run, and it did survive — while being a
- * real production regression, since in production an operator's explicit value arrives
- * from {@code application.yml} or the {@code SPRING_LIQUIBASE_PARAMETERS_*} environment
- * variable rather than from a test annotation. These two tests are what close that gap.
+ * <p>That is a measured statement, not a preference. Every boot test here that supplies an
+ * explicit target does it through {@code @TestPropertySource}, whose inlined properties are
+ * already in the Environment when post-processors run (an earlier wording here said they
+ * attach afterwards; that was measured false — see {@code ExplicitTargetBeatsDerivedBootTest}).
+ * The post-processor therefore takes its explicit-value early return and never reaches the
+ * {@code addLast}/{@code addFirst} branch, and a mutation flipping {@code addLast} to
+ * {@code addFirst} SURVIVES every boot test in this repo — it was run, and it did survive.
+ * It is still a real regression: the bottom-of-list placement is the second line of
+ * defence for an explicit value attached AFTER post-processors run (an
+ * {@code ApplicationContextInitializer}), which the early return cannot see. These two
+ * tests are what close that gap.
  */
 class RestampTargetEnvironmentPostProcessorTest {
 

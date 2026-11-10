@@ -1,0 +1,8 @@
+# Test-only profile for EnvVarRestampPinBootTest.theEnvVarPinOutranksAConfigFileValue:
+# a config-file (application.yml tier) value for the 007 re-stamp target, so that test can
+# prove the SPRING_LIQUIBASE_PARAMETERS_WIKI_RESTAMP_TARGET_DOMAIN environment variable
+# outranks it. Active ONLY when that test adds the "envpin-yml" profile.
+spring:
+  liquibase:
+    parameters:
+      wiki.restamp.target.domain: brand-c

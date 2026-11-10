@@ -3,8 +3,11 @@ package net.hugmesh.wikibff.db;
 import net.hugmesh.commons.testsupport.PostgresTestSupport;
 import net.hugmesh.wikibff.config.RestampTargetEnvironmentPostProcessor;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.core.env.Environment;
 import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -28,13 +31,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  * wrong and a mutation proved it: it catches the loss of the EXPLICIT-OVERRIDE EARLY
  * RETURN in {@code RestampTargetEnvironmentPostProcessor}. It does NOT catch
  * {@code addLast -> addFirst} — measured: that mutation leaves this test green, because
- * {@code @TestPropertySource} attaches its inlined properties with {@code addFirst} AFTER
- * environment post-processors have run, so no {@code @SpringBootTest} in this repo can
- * tell the two orderings apart. {@code RestampTargetEnvironmentPostProcessorTest} is the
- * test that pins the ordering, on a bare {@code StandardEnvironment}. Nothing else in the
- * suite boots with both values present at once, so without this test the early-return
- * mutation survives.
+ * the early return fires first. Spring Boot's test context loader adds the
+ * {@code @TestPropertySource} inlined properties to the Environment BEFORE
+ * {@code SpringApplication.run}, so the post-processor reads {@code typed-by-hand} as the
+ * explicit target and contributes nothing, and neither placement branch is reached. (An
+ * earlier wording here said those properties attach AFTER post-processors run; that was
+ * wrong, and the log assertion below is the measurement that keeps it from coming back.)
+ * {@code RestampTargetEnvironmentPostProcessorTest} is the test that pins the ordering, on
+ * a bare {@code StandardEnvironment}. Nothing else in the suite boots with both values
+ * present at once, so without this test the early-return mutation survives.
+ *
+ * <p>The log assertion relies on this class's {@code @TestPropertySource} set being
+ * unique, so its context is never served from Spring's test-context cache (a cached
+ * context would not boot again and would print nothing).
  */
+@ExtendWith(OutputCaptureExtension.class)
 @SpringBootTest
 @ActiveProfiles("test")
 @TestPropertySource(properties = {
@@ -54,5 +65,17 @@ class ExplicitTargetBeatsDerivedBootTest extends PostgresTestSupport {
                 .as("the derivation would say 'acme' here; an operator who typed a value must"
                         + " still win, or the override escape hatch does not exist")
                 .isEqualTo("typed-by-hand");
+    }
+
+    @Test
+    void thePostProcessorSawTheInlinedValueAsTheExplicitTarget(CapturedOutput output) {
+        // Value equality above would also hold if the post-processor never saw the value and
+        // the inlined source merely outranked a bottom-of-list derived contribution. This
+        // line is printed only from the explicit-value early return, so it proves the
+        // @TestPropertySource value was already in the Environment when post-processors ran.
+        assertThat(output.getAll())
+                .as("@TestPropertySource values must be visible to environment post-processors;"
+                        + " the post-processor has to log 'typed-by-hand' as the explicit target")
+                .contains("re-stamp target explicitly set to 'typed-by-hand'");
     }
 }
