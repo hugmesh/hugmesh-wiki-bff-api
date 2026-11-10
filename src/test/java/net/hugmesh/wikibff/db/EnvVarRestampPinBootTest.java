@@ -42,20 +42,25 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <h2>Why the existing boot tests do not cover it</h2>
  *
  * <p>{@link RestampParameterBindingBootTest} and {@link ExplicitTargetBeatsDerivedBootTest}
- * set the pin as the DOTTED property through {@code @TestPropertySource}. Two links of the
- * production chain are therefore never exercised:
- * <ol>
- *   <li>Relaxed binding of an UPPER_SNAKE environment key into the
- *       {@code spring.liquibase.parameters} MAP. The map key Liquibase receives has to come
- *       out as {@code wiki.restamp.target.domain}; that conversion is done by the
- *       system-environment mapper, which Boot applies only to a
- *       {@link SystemEnvironmentPropertySource} named {@code systemEnvironment}.</li>
- *   <li>Visibility to {@link RestampTargetEnvironmentPostProcessor}. {@code @TestPropertySource}
- *       attaches its values AFTER environment post-processors run, so those tests only show
- *       the explicit value winning by source ORDER. In production the env var is already in
- *       the Environment when the post-processor runs, and the override is protected by its
- *       explicit early return, not by ordering.</li>
- * </ol>
+ * set the pin as the DOTTED property through {@code @TestPropertySource}. The link of the
+ * production chain they never exercise is relaxed binding of an UPPER_SNAKE environment
+ * key into the {@code spring.liquibase.parameters} MAP: the map key Liquibase receives has
+ * to come out as {@code wiki.restamp.target.domain}, and that conversion is done by the
+ * system-environment mapper, which Boot applies only to a
+ * {@link SystemEnvironmentPropertySource} named {@code systemEnvironment}. The same lookup
+ * is what {@link RestampTargetEnvironmentPostProcessor}'s explicit-value check depends on
+ * when the operator's value is an environment variable, so the cases below also prove the
+ * post-processor SEES the env spelling as explicit (it logs it as such and contributes no
+ * derived source).
+ *
+ * <p>Visibility to the post-processor in general is NOT new coverage. An earlier draft of
+ * this javadoc said {@code @TestPropertySource} attaches its values after environment
+ * post-processors run; that is false, and was measured false: Spring Boot's test context
+ * loader adds the inlined-properties source to the Environment BEFORE
+ * {@code SpringApplication.run}, so the post-processor already reads those values,
+ * logs them as the explicit target and takes its early return.
+ * {@link ExplicitTargetBeatsDerivedBootTest} asserts that log line and already fails when
+ * the early return is removed.
  *
  * <h2>How the environment variable is supplied (no JVM env mutation)</h2>
  *

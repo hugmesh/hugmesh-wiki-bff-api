@@ -39,8 +39,9 @@ import org.springframework.core.env.MapPropertySource;
  * cut-over, which the next section explains is not optional.
  *
  * <p>{@link org.springframework.core.env.MutablePropertySources#addLast addLast} is the
- * second line of defence, covering sources attached AFTER post-processors run (a test's
- * inlined {@code properties = {...}}, an {@code ApplicationContextInitializer}). The one
+ * second line of defence, covering sources attached AFTER post-processors run (an
+ * {@code ApplicationContextInitializer}; NOT a test's {@code @TestPropertySource}, whose
+ * inlined properties are already in the Environment when this runs). The one
  * exception is a BLANK explicit value: blank is not an override, but it does outrank a
  * lowest-precedence contribution, so it would silently suppress the derivation and leave
  * the cut-over inert. That case — and only that case — is contributed with
